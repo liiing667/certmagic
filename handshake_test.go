@@ -18,6 +18,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"runtime"
 	"strings"
@@ -225,5 +226,150 @@ func TestGetCertDuringHandshakeWaiterErrorPropagation(t *testing.T) {
 	// rather than recursing into their own load/obtain attempts.
 	if got := decisionCalls.Load(); got != 1 {
 		t.Errorf("expected exactly 1 decision-func call (leader only), got %d", got)
+	}
+}
+
+// staticManager is a Manager that returns a fixed certificate and/or error.
+type staticManager struct {
+	cert  *tls.Certificate
+	err   error
+	calls atomic.Int32
+}
+
+func (m *staticManager) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	m.calls.Add(1)
+	return m.cert, m.err
+}
+
+// externalCertFor returns a certificate based on testCertificate, but with
+// the given SANs and validity window.
+func externalCertFor(tb testing.TB, names []string, notBefore, notAfter time.Time) *tls.Certificate {
+	tb.Helper()
+	cert := testCertificate(tb)
+	leaf := *cert.Leaf
+	leaf.DNSNames = names
+	leaf.NotBefore = notBefore
+	leaf.NotAfter = notAfter
+	cert.Leaf = &leaf
+	return &cert
+}
+
+// TestExternalManagerAuthorization verifies that the on-demand authorization
+// checks (DecisionFunc / host allowlist) are enforced before certificates
+// from external Managers are accepted.
+func TestExternalManagerAuthorization(t *testing.T) {
+	newCfg := func(onDemand *OnDemandConfig) *Config {
+		return &Config{
+			Logger:    defaultTestLogger,
+			certCache: &Cache{cache: make(map[string]Certificate), cacheIndex: make(map[string][]string), logger: defaultTestLogger},
+			OnDemand:  onDemand,
+		}
+	}
+	hello := &tls.ClientHelloInfo{ServerName: "example.com", Conn: testConn{}}
+	now := time.Now()
+	validCert := externalCertFor(t, []string{"example.com"}, now.Add(-time.Hour), now.Add(time.Hour))
+
+	// A certificate from an external manager must not be accepted when the
+	// DecisionFunc denies the name; the manager must not even be consulted.
+	mgr := &staticManager{cert: validCert}
+	cfg := newCfg(&OnDemandConfig{
+		Managers: []Manager{mgr},
+		DecisionFunc: func(ctx context.Context, name string) error {
+			return fmt.Errorf("denied")
+		},
+	})
+	if _, err := cfg.GetCertificate(hello); err == nil {
+		t.Error("expected error when DecisionFunc denies name, got certificate")
+	}
+	if got := mgr.calls.Load(); got != 0 {
+		t.Errorf("expected manager not to be consulted for denied name, got %d calls", got)
+	}
+
+	// Same, but enforced via the implicit host allowlist.
+	mgr = &staticManager{cert: validCert}
+	cfg = newCfg(&OnDemandConfig{
+		Managers:      []Manager{mgr},
+		hostAllowlist: map[string]struct{}{"other.example.com": {}},
+	})
+	if _, err := cfg.GetCertificate(hello); err == nil {
+		t.Error("expected error when name is not in host allowlist, got certificate")
+	}
+	if got := mgr.calls.Load(); got != 0 {
+		t.Errorf("expected manager not to be consulted for disallowed name, got %d calls", got)
+	}
+}
+
+// TestExternalManagerCertificateConstraints verifies that certificates from
+// external Managers are only served if they cover the requested server name
+// and are currently valid.
+func TestExternalManagerCertificateConstraints(t *testing.T) {
+	newCfg := func(managers ...Manager) *Config {
+		return &Config{
+			Logger:    defaultTestLogger,
+			certCache: &Cache{cache: make(map[string]Certificate), cacheIndex: make(map[string][]string), logger: defaultTestLogger},
+			OnDemand:  &OnDemandConfig{Managers: managers},
+		}
+	}
+	now := time.Now()
+	validFrom, validTo := now.Add(-time.Hour), now.Add(time.Hour)
+
+	for i, tc := range []struct {
+		names     []string
+		notBefore time.Time
+		notAfter  time.Time
+		sni       string
+		expectErr bool
+	}{
+		{names: []string{"example.com"}, notBefore: validFrom, notAfter: validTo, sni: "example.com"},
+		// multi-SAN certificate covering the SNI
+		{names: []string{"other.com", "example.com"}, notBefore: validFrom, notAfter: validTo, sni: "example.com"},
+		// wildcard certificate covering the SNI
+		{names: []string{"*.example.com"}, notBefore: validFrom, notAfter: validTo, sni: "sub.example.com"},
+		// certificate does not cover the SNI
+		{names: []string{"other.com"}, notBefore: validFrom, notAfter: validTo, sni: "example.com", expectErr: true},
+		// wildcard does not cover the bare domain
+		{names: []string{"*.example.com"}, notBefore: validFrom, notAfter: validTo, sni: "example.com", expectErr: true},
+		// expired certificate
+		{names: []string{"example.com"}, notBefore: now.Add(-2 * time.Hour), notAfter: now.Add(-time.Hour), sni: "example.com", expectErr: true},
+		// not-yet-valid certificate
+		{names: []string{"example.com"}, notBefore: now.Add(time.Hour), notAfter: now.Add(2 * time.Hour), sni: "example.com", expectErr: true},
+	} {
+		mgr := &staticManager{cert: externalCertFor(t, tc.names, tc.notBefore, tc.notAfter)}
+		cfg := newCfg(mgr)
+		hello := &tls.ClientHelloInfo{ServerName: tc.sni, Conn: testConn{}}
+		cert, err := cfg.GetCertificate(hello)
+		if tc.expectErr {
+			if err == nil {
+				t.Errorf("test %d: expected error for names=%v sni=%s, got certificate", i, tc.names, tc.sni)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("test %d: expected certificate for names=%v sni=%s, got error: %v", i, tc.names, tc.sni, err)
+		} else if cert == nil || cert.Leaf == nil {
+			t.Errorf("test %d: expected certificate for names=%v sni=%s, got nil", i, tc.names, tc.sni)
+		}
+	}
+}
+
+// TestExternalManagerErrorNoFallback verifies that an error from an external
+// Manager aborts the handshake: later managers are not consulted, and no
+// other certificate source is tried.
+func TestExternalManagerErrorNoFallback(t *testing.T) {
+	mgrErr := errors.New("manager is broken")
+	errMgr := &staticManager{err: mgrErr}
+	backupMgr := &staticManager{cert: externalCertFor(t, []string{"example.com"}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))}
+	cfg := &Config{
+		Logger:    defaultTestLogger,
+		certCache: &Cache{cache: make(map[string]Certificate), cacheIndex: make(map[string][]string), logger: defaultTestLogger},
+		OnDemand:  &OnDemandConfig{Managers: []Manager{errMgr, backupMgr}},
+	}
+	hello := &tls.ClientHelloInfo{ServerName: "example.com", Conn: testConn{}}
+	_, err := cfg.GetCertificate(hello)
+	if err == nil || !strings.Contains(err.Error(), mgrErr.Error()) {
+		t.Errorf("expected manager error to be returned, got: %v", err)
+	}
+	if got := backupMgr.calls.Load(); got != 0 {
+		t.Errorf("expected later managers not to be consulted after error, got %d calls", got)
 	}
 }

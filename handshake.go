@@ -347,6 +347,14 @@ func (cfg *Config) getCertDuringHandshake(ctx context.Context, hello *tls.Client
 		certLoadWaitChansMu.Unlock()
 	}()
 
+	// Make sure a certificate is allowed for the given name. If not, it doesn't make sense
+	// to ask external managers for one, to try loading one from storage (issue #185), or
+	// to obtain one from an issuer. This check MUST come before any source of certificates
+	// so that unauthorized names can never be served a certificate.
+	if err := cfg.checkIfCertShouldBeObtained(ctx, name, false); err != nil {
+		return Certificate{}, fmt.Errorf("certificate is not allowed for server name %s: %w", name, err)
+	}
+
 	// If an external Manager is configured, try to get it from them.
 	// Only continue to use our own logic if it returns empty+nil.
 	externalCert, err := cfg.getCertFromAnyCertManager(ctx, hello, logger)
@@ -355,14 +363,16 @@ func (cfg *Config) getCertDuringHandshake(ctx context.Context, hello *tls.Client
 		return Certificate{}, err
 	}
 	if !externalCert.Empty() {
+		// An externally-managed certificate is only usable for this handshake
+		// if it actually covers the requested name and is currently valid;
+		// otherwise we must not serve it, nor fall back to another source,
+		// since the manager asserted it handles this handshake.
+		if err := verifyExternalCertificate(externalCert, name); err != nil {
+			waiter.err = err
+			return Certificate{}, err
+		}
 		waiter.cert = externalCert
 		return externalCert, nil
-	}
-
-	// Make sure a certificate is allowed for the given name. If not, it doesn't make sense
-	// to try loading one from storage (issue #185) or obtaining one from an issuer.
-	if err := cfg.checkIfCertShouldBeObtained(ctx, name, false); err != nil {
-		return Certificate{}, fmt.Errorf("certificate is not allowed for server name %s: %w", name, err)
 	}
 
 	// We might be able to load or obtain a needed certificate. Load from
@@ -833,19 +843,20 @@ func (cfg *Config) getCertFromAnyCertManager(ctx context.Context, hello *tls.Cli
 	for i, certManager := range cfg.OnDemand.Managers {
 		upstreamCert, err = certManager.GetCertificate(ctx, hello)
 		if err != nil {
+			// An error from a manager that claims this handshake is authoritative:
+			// do not try other managers, and do not fall back to storage or
+			// issuers, which could cause a certificate to be obtained for a
+			// name the erroring manager never intended to authorize.
 			logger.Error("external certificate manager",
 				zap.String("sni", hello.ServerName),
 				zap.String("cert_manager", fmt.Sprintf("%T", certManager)),
 				zap.Int("cert_manager_idx", i),
 				zap.Error(err))
-			continue
+			return Certificate{}, fmt.Errorf("external certificate manager indicated that it is unable to yield certificate: %v", err)
 		}
 		if upstreamCert != nil {
 			break
 		}
-	}
-	if err != nil {
-		return Certificate{}, fmt.Errorf("external certificate manager indicated that it is unable to yield certificate: %v", err)
 	}
 	if upstreamCert == nil {
 		logger.Debug("all external certificate managers yielded no certificates and no errors", zap.String("sni", hello.ServerName))
@@ -863,6 +874,26 @@ func (cfg *Config) getCertFromAnyCertManager(ctx context.Context, hello *tls.Cli
 		zap.Time("expiration", expiresAt(cert.Leaf)))
 
 	return cert, nil
+}
+
+// verifyExternalCertificate ensures that a certificate returned by an external
+// certificate Manager is actually usable for a handshake for name: the
+// certificate must cover name (including via wildcard or IP SANs) and must be
+// within its validity window. This prevents a manager from accidentally or
+// maliciously serving certificates for the wrong host, or expired or
+// not-yet-valid certificates.
+func verifyExternalCertificate(cert Certificate, name string) error {
+	if cert.Leaf == nil {
+		return fmt.Errorf("external certificate manager: %s: certificate has no leaf", name)
+	}
+	if err := cert.Leaf.VerifyHostname(name); err != nil {
+		return fmt.Errorf("external certificate manager: certificate does not cover server name %s: %v", name, err)
+	}
+	if now := time.Now(); now.Before(cert.Leaf.NotBefore) || now.After(expiresAt(cert.Leaf)) {
+		return fmt.Errorf("external certificate manager: certificate for %s is not currently valid (not_before: %s, not_after: %s)",
+			name, cert.Leaf.NotBefore, cert.Leaf.NotAfter)
+	}
+	return nil
 }
 
 // getTLSALPNChallengeCert is to be called when the clientHello pertains to
