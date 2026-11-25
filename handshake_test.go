@@ -113,6 +113,139 @@ func TestGetCertificate(t *testing.T) {
 	}
 }
 
+// TestNormalizedName verifies that every host identity - plain DNS names,
+// internationalized domain names, wildcard names, and IPv4/IPv6 literals -
+// canonicalizes to a single stable string. The handshake cache lookup path
+// (getCertificateFromCache) and the issuance/storage/challenge path
+// (getNameFromClientHello) must both derive the exact same identity from a
+// ClientHello, otherwise a certificate obtained under one name cannot be
+// found under the other (see the "two names" split between IDNA-punycode
+// and the old lowercase-only normalization, and the hard failure of
+// idna.Lookup.ToASCII on IPv6 literals' colons).
+func TestNormalizedName(t *testing.T) {
+	for i, test := range []struct {
+		input  string
+		expect string
+	}{
+		// plain DNS names: trimmed and lowercased
+		{"example.com", "example.com"},
+		{"  WWW.Example.COM  ", "www.example.com"},
+
+		// internationalized domain names: always punycode, regardless of
+		// whether the client sent Unicode or already-encoded ASCII
+		{"bücher.example", "xn--bcher-kva.example"},
+		{"BÜCHER.Example", "xn--bcher-kva.example"},
+		{"xn--bcher-kva.example", "xn--bcher-kva.example"},
+		// the non-1:1 Greek sigma case must use the Lookup profile mapping
+		{"σςΣ.example", "xn--3xabb.example"},
+
+		// wildcard names are valid managed identifiers even though the
+		// Lookup profile rejects the '*' label
+		{"*.example.com", "*.example.com"},
+		{"*.bücher.example", "*.xn--bcher-kva.example"},
+
+		// IPv4 literals pass through and are lowercased/trimmed
+		{"192.0.2.1", "192.0.2.1"},
+		{"  192.0.2.1  ", "192.0.2.1"},
+
+		// IPv6 literals must NOT be fed to IDNA (colons are disallowed
+		// rune points) but canonicalized through net.ParseIP instead
+		{"2001:db8::1", "2001:db8::1"},
+		{"2001:DB8::1", "2001:db8::1"},
+		{"::1", "::1"},
+		// bracketed or host:port forms reduce to the bare literal
+		{"[2001:db8::1]", "2001:db8::1"},
+		{"[2001:db8::1]:443", "2001:db8::1"},
+		// zone/scope identifiers are not part of the host identity
+		{"fe80::1%eth0", "fe80::1"},
+	} {
+		actual := normalizedName(test.input)
+		if actual != test.expect {
+			t.Errorf("Test %d: normalizedName(%q) = %q, want %q",
+				i, test.input, actual, test.expect)
+		}
+	}
+}
+
+// TestNormalizedNameIsStable asserts the two handshake normalization paths
+// agree, so a certificate cached under the issuance/storage identity can
+// always be located by the in-memory cache lookup identity.
+func TestNormalizedNameIsStable(t *testing.T) {
+	cfg := &Config{Logger: defaultTestLogger}
+
+	for _, sni := range []string{
+		"example.com",
+		"bücher.example",        // Unicode IDN straight from a client
+		"xn--bcher-kva.example", // the same host, already punycode
+		"2001:db8::1",           // IPv6 literal (colons break IDNA Lookup)
+		"[2001:db8::1]",         // bracketed IPv6 literal
+		"192.0.2.1",
+	} {
+		hello := &tls.ClientHelloInfo{ServerName: sni}
+		issuanceName, err := cfg.getNameFromClientHello(hello)
+		if err != nil {
+			t.Errorf("getNameFromClientHello(%q) returned unexpected error: %v", sni, err)
+			continue
+		}
+		cacheName := normalizedName(hello.ServerName)
+		if issuanceName != cacheName {
+			t.Errorf("identity split for SNI %q: issuance/challenge path uses %q but cache lookup uses %q",
+				sni, issuanceName, cacheName)
+		}
+	}
+
+	// an empty SNI with no DefaultServerName falls back to the connection's
+	// local IP; with a nil conn it must yield an empty string rather than an
+	// IDNA error, and with a DefaultServerName it must use the same canonical
+	// identity as every other path
+	if name, err := cfg.getNameFromClientHello(&tls.ClientHelloInfo{}); err != nil || name != "" {
+		t.Errorf("empty SNI with nil conn: got name=%q err=%v, want empty name and no error", name, err)
+	}
+	cfg.DefaultServerName = "bücher.example"
+	name, err := cfg.getNameFromClientHello(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("getNameFromClientHello with DefaultServerName: %v", err)
+	}
+	if want := normalizedName(cfg.DefaultServerName); name != want {
+		t.Errorf("DefaultServerName path: got %q, want %q", name, want)
+	}
+}
+
+// TestGetCertificateFromCacheIDNAndIPv6 verifies the cache lookup path
+// matches certificates by the same canonical identity used when they were
+// issued and indexed: Unicode IDN SNIs match punycode-indexed certs, and
+// IPv6 literal SNIs match IP-indexed certs instead of failing IDNA.
+func TestGetCertificateFromCacheIDNAndIPv6(t *testing.T) {
+	certCache := &Cache{cache: make(map[string]Certificate), cacheIndex: make(map[string][]string), logger: defaultTestLogger}
+	cfg := &Config{Logger: defaultTestLogger, certCache: certCache}
+
+	idnCert := Certificate{
+		Names:       []string{"xn--bcher-kva.example"},
+		Certificate: tls.Certificate{Leaf: &x509.Certificate{DNSNames: []string{"xn--bcher-kva.example"}}},
+		hash:        "idn-cert",
+	}
+	ipv6Cert := Certificate{
+		Names:       []string{"2001:db8::1"},
+		Certificate: tls.Certificate{Leaf: &x509.Certificate{IPAddresses: []net.IP{net.ParseIP("2001:db8::1")}}},
+		hash:        "ipv6-cert",
+	}
+	certCache.cacheCertificate(idnCert)
+	certCache.cacheCertificate(ipv6Cert)
+
+	// client sends the IDN in raw Unicode; the cert is indexed by punycode
+	if cert, matched, defaulted := cfg.getCertificateFromCache(&tls.ClientHelloInfo{ServerName: "bücher.example"}); !matched || defaulted {
+		t.Errorf("Unicode IDN SNI should match punycode-indexed cert, got matched=%v defaulted=%v cert=%v", matched, defaulted, cert.Names)
+	}
+	// client sends an IPv6 literal SNI; the cert is indexed by the bare IP
+	if cert, matched, defaulted := cfg.getCertificateFromCache(&tls.ClientHelloInfo{ServerName: "2001:db8::1"}); !matched || defaulted {
+		t.Errorf("IPv6 literal SNI should match IP-indexed cert, got matched=%v defaulted=%v cert=%v", matched, defaulted, cert.Names)
+	}
+	// bracketed/upper-case spellings are the same host identity
+	if cert, matched, _ := cfg.getCertificateFromCache(&tls.ClientHelloInfo{ServerName: "2001:DB8::1"}); !matched {
+		t.Errorf("upper-case IPv6 SNI should match, got %v", cert.Names)
+	}
+}
+
 // TestGetCertDuringHandshakeWaiterErrorPropagation verifies that when the
 // "leader" goroutine loading/obtaining a certificate for a name fails (e.g.
 // an on-demand permission denial), the failure is propagated directly to all

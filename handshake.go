@@ -899,16 +899,10 @@ func (cfg *Config) getTLSALPNChallengeCert(clientHello *tls.ClientHelloInfo) (*t
 // If hello.ServerName is empty (i.e. client did not use SNI), then the
 // associated connection's local address is used to extract an IP address.
 func (cfg *Config) getNameFromClientHello(hello *tls.ClientHelloInfo) (string, error) {
-	// IDNs must be converted to punycode for use in TLS certificates (and SNI), but not
-	// all clients do that, so convert IDNs to ASCII according to RFC 5280 section 7
-	// using profile recommended by RFC 5891 section 5; this solves the "σςΣ" problem
-	// (see https://unicode.org/faq/idn.html#22) where not all normalizations are 1:1.
-	// The Lookup profile, for instance, rejects wildcard characters (*), but they
-	// should never be used in the ClientHello SNI anyway.
-	name, err := idna.Lookup.ToASCII(strings.TrimSpace(hello.ServerName))
-	if err != nil {
-		return "", err
-	}
+	// normalizedName canonicalizes both IDNs and IP literals, so the name
+	// used here is the exact same identity used for cache lookups, storage
+	// keys, ACME challenges, and the certificate's SANs.
+	name := normalizedName(hello.ServerName)
 	if name != "" {
 		return name, nil
 	}
@@ -953,10 +947,49 @@ func localIPFromConn(c net.Conn) string {
 	return ip
 }
 
-// normalizedName returns a cleaned form of serverName that is
-// used for consistency when referring to a SNI value.
+// normalizedName returns the canonical host identity for serverName so
+// that every code path that refers to a host - certificate cache lookups,
+// on-demand issuance, storage keys, ACME challenge identifiers, and the
+// SANs of issued certificates - uses one and the same string.
+//
+// Domain names (including internationalized domain names) are converted
+// to lowercase ASCII/punycode according to RFC 5280 section 7 and the
+// profile recommended by RFC 5891 section 5; this solves the "σςΣ"
+// problem (see https://unicode.org/faq/idn.html#22) where not all
+// normalizations are 1:1.
+//
+// IP literals are not domain names and must never be run through IDNA:
+// the colons (and brackets) in an IPv6 literal are disallowed IDNA code
+// points, so idna.Lookup.ToASCII rejects e.g. "2001:db8::1" outright.
+// They are canonicalized through net.ParseIP instead, which also
+// normalizes their spelling and strips any zone/scope identifier.
 func normalizedName(serverName string) string {
-	return strings.ToLower(strings.TrimSpace(serverName))
+	serverName = strings.TrimSpace(serverName)
+
+	// Canonicalize IP address literals (IPv4 and IPv6, optionally wrapped
+	// in brackets or carrying a port or zone identifier) without IDNA.
+	if host := hostOnly(serverName); host != "" {
+		if zoneIDStart := strings.Index(host, "%"); zoneIDStart > -1 {
+			host = host[:zoneIDStart]
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			return ip.String()
+		}
+	}
+
+	// IDNs must be converted to punycode for use in TLS certificates (and
+	// SNI), but not all clients do that, so do it ourselves. The Lookup
+	// profile rejects wildcard labels ("*"), which never appear in a real
+	// ClientHello but are valid managed identifiers, so fall back to the
+	// permissive profile for such names rather than returning them raw.
+	if name, err := idna.Lookup.ToASCII(serverName); err == nil {
+		return name
+	}
+	if name, err := idna.ToASCII(serverName); err == nil {
+		return strings.ToLower(name)
+	}
+
+	return strings.ToLower(serverName)
 }
 
 // obtainCertWaitChans is used to coordinate obtaining certs for each hostname.
