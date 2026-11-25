@@ -136,7 +136,15 @@ func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 		}
 
 		// if time is up or expires soon, we need to try to renew it
-		if cert.NeedsRenewal(cfg) {
+		needsRenewal := cert.NeedsRenewal(cfg)
+		if !needsRenewal {
+			// The certificate no longer needs renewal (it may have been renewed
+			// by another instance or reloaded from storage). Drop any backoff
+			// state left over from earlier failed attempts so it cannot delay a
+			// future renewal once this certificate does start expiring.
+			renewalRetrySchedule.clear("renew_" + cert.Names[0])
+		}
+		if needsRenewal {
 			configs[cert.hash] = cfg
 
 			// see if the certificate in storage has already been renewed, possibly by another
@@ -281,7 +289,7 @@ func (certCache *Cache) queueRenewalTask(ctx context.Context, oldCert Certificat
 					zap.Strings("identifiers", oldCert.Names),
 					zap.Error(err))
 			}
-			return fmt.Errorf("%v %v", oldCert.Names, err)
+			return fmt.Errorf("%v: %w", oldCert.Names, err)
 		}
 		renewalRetrySchedule.clear(jobName)
 
@@ -289,7 +297,7 @@ func (certCache *Cache) queueRenewalTask(ctx context.Context, oldCert Certificat
 		// renewed certificate so it will be used with handshakes
 		_, err = cfg.reloadManagedCertificate(ctx, oldCert)
 		if err != nil {
-			return ErrNoRetry{fmt.Errorf("%v %v", oldCert.Names, err)}
+			return ErrNoRetry{fmt.Errorf("%v: %w", oldCert.Names, err)}
 		}
 		return nil
 	})

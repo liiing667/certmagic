@@ -189,6 +189,87 @@ func TestDoWithRetryReturnsLastErrorOnExhaustion(t *testing.T) {
 	}
 }
 
+// TestDoWithRetryReturnsMostRecentError verifies that when an operation keeps
+// failing, the error returned is the one from the latest attempt, not the
+// original error from the first attempt.
+func TestDoWithRetryReturnsMostRecentError(t *testing.T) {
+	logger := zap.NewNop()
+	ctx := context.Background()
+
+	originalIntervals := retryIntervals
+	retryIntervals = []time.Duration{time.Millisecond}
+	t.Cleanup(func() { retryIntervals = originalIntervals })
+
+	firstErr := fmt.Errorf("first failure")
+	secondErr := fmt.Errorf("second failure")
+	finalErr := fmt.Errorf("final failure")
+	attempt := 0
+	err := doWithRetry(ctx, logger, func(ctx context.Context) error {
+		attempt++
+		switch attempt {
+		case 1:
+			return firstErr
+		case 2:
+			return secondErr
+		default:
+			return ErrNoRetry{finalErr}
+		}
+	})
+	if !errors.Is(err, finalErr) {
+		t.Fatalf("expected the most recent error %v, got: %v", finalErr, err)
+	}
+	if attempt != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempt)
+	}
+}
+
+// TestDoWithRetryPreservesLastErrorOnCancellation verifies that cancelling
+// during a long retry backoff still surfaces the error from the last attempt,
+// instead of reporting only context cancellation.
+func TestDoWithRetryPreservesLastErrorOnCancellation(t *testing.T) {
+	logger := zap.NewNop()
+
+	originalIntervals := retryIntervals
+	retryIntervals = []time.Duration{time.Hour}
+	t.Cleanup(func() { retryIntervals = originalIntervals })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	lastErr := fmt.Errorf("issuer is still broken")
+	attempted := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- doWithRetry(ctx, logger, func(ctx context.Context) error {
+			select {
+			case <-attempted:
+			default:
+				close(attempted)
+			}
+			return lastErr
+		})
+	}()
+
+	select {
+	case <-attempted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("operation was never attempted")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, lastErr) {
+			t.Fatalf("expected last operation error to be preserved, got: %v", err)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected error to also report cancellation, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("doWithRetry did not return after cancellation")
+	}
+}
+
 func waitUntil(timeout time.Duration, cond func() bool) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

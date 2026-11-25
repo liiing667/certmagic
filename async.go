@@ -184,7 +184,7 @@ func doWithRetry(ctx context.Context, log *zap.Logger, f func(context.Context) e
 	// the initial intervalIndex is -1, signaling
 	// that we should not wait for the first attempt
 	start, intervalIndex := time.Now(), -1
-	var err error
+	var lastErr error
 
 	for time.Since(start) < maxRetryDuration {
 		var wait time.Duration
@@ -195,10 +195,18 @@ func doWithRetry(ctx context.Context, log *zap.Logger, f func(context.Context) e
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return context.Canceled
+			// Preserve the latest operation error if we already made any
+			// attempts. Otherwise callers that cancel during the (possibly
+			// very long) backoff sleep would only learn that the context was
+			// canceled, losing the actual reason the operation kept failing.
+			if lastErr != nil {
+				return errors.Join(lastErr, ctx.Err())
+			}
+			return ctx.Err()
 		case <-timer.C:
-			err = f(ctx)
+			err := f(ctx)
 			attempts++
+			lastErr = err
 			if err == nil || errors.Is(err, context.Canceled) {
 				return err
 			}
@@ -226,7 +234,10 @@ func doWithRetry(ctx context.Context, log *zap.Logger, f func(context.Context) e
 			}
 		}
 	}
-	return err
+	// If the retry budget ran out between attempts, return the error from the
+	// most recent attempt. Never report a failed operation as successful, and
+	// never replace the latest failure with an earlier one.
+	return lastErr
 }
 
 // ErrNoRetry is an error type which signals

@@ -6,6 +6,7 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"math/big"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +27,54 @@ func (fi *failingIssuer) Issue(ctx context.Context, csr *x509.CertificateRequest
 }
 
 func (fi *failingIssuer) IssuerKey() string { return "failing_test_issuer" }
+
+// signalingFailIssuer reports when its first attempt has been made, then
+// always fails.
+type signalingFailIssuer struct {
+	calls     atomic.Int32
+	attempted chan struct{}
+	once      sync.Once
+	err       error
+}
+
+func (si *signalingFailIssuer) Issue(ctx context.Context, csr *x509.CertificateRequest) (*IssuedCertificate, error) {
+	si.calls.Add(1)
+	si.once.Do(func() { close(si.attempted) })
+	return nil, si.err
+}
+
+func (si *signalingFailIssuer) IssuerKey() string { return "signaling_fail_test_issuer" }
+
+// lockTrackingStorage records whether the certificate lock is currently held.
+type lockTrackingStorage struct {
+	*FileStorage
+	mu     sync.Mutex
+	locked bool
+}
+
+func (s *lockTrackingStorage) Lock(ctx context.Context, name string) error {
+	if err := s.FileStorage.Lock(ctx, name); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.locked = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *lockTrackingStorage) Unlock(ctx context.Context, name string) error {
+	err := s.FileStorage.Unlock(ctx, name)
+	s.mu.Lock()
+	s.locked = false
+	s.mu.Unlock()
+	return err
+}
+
+func (s *lockTrackingStorage) isLocked() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.locked
+}
 
 // TestQueueRenewalTaskPacesRetriesItself is a regression test for
 // caddyserver/caddy#7843: after a transient failure (e.g. a DNS outage)
@@ -156,5 +205,173 @@ func TestQueueRenewalTaskPacesRetriesItself(t *testing.T) {
 	}
 	if !waitUntil(time.Second, func() bool { return issuer.calls.Load() == 2 }) {
 		t.Fatalf("expected a second issuance attempt once the backoff interval elapsed, got %d", issuer.calls.Load())
+	}
+}
+
+// TestManageOneAsyncDoesNotHoldRenewalJob verifies that asynchronous
+// management does not submit a renewal job that camps on the jobManager's
+// dedup slot for the whole retry budget. A failing attempt must return and
+// release the name so the periodic maintenance loop can pace the next attempt.
+func TestManageOneAsyncDoesNotHoldRenewalJob(t *testing.T) {
+	const domain = "manage-async.example.com"
+	issuer := &failingIssuer{err: fmt.Errorf("simulated renewal failure")}
+
+	certCache := &Cache{
+		cache:      make(map[string]Certificate),
+		cacheIndex: make(map[string][]string),
+		logger:     defaultTestLogger,
+	}
+	cfg := &Config{
+		Issuers:          []Issuer{issuer},
+		Storage:          &FileStorage{Path: t.TempDir()},
+		Logger:           defaultTestLogger,
+		DisableARI:       true,
+		ReusePrivateKeys: true,
+		certCache:        certCache,
+	}
+	cfg.OCSP.DisableStapling = true
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: domain},
+		DNSNames:     []string{domain},
+		NotBefore:    time.Now().Add(-60 * 24 * time.Hour),
+		NotAfter:     time.Now().Add(-time.Hour),
+	}
+	_, priv, certPEM := mustIssueTestCertificate(t, tmpl, nil, nil)
+	privPEM, err := PEMEncodePrivateKey(priv)
+	if err != nil {
+		t.Fatalf("encoding private key: %v", err)
+	}
+	certRes := CertificateResource{
+		SANs:           []string{domain},
+		CertificatePEM: certPEM,
+		PrivateKeyPEM:  privPEM,
+		issuerKey:      issuer.IssuerKey(),
+	}
+	ctx := context.Background()
+	if err := cfg.saveCertResource(ctx, issuer, certRes); err != nil {
+		t.Fatalf("seeding cert resource in storage: %v", err)
+	}
+	jobName := "renew_" + domain
+	renewalRetrySchedule.clear(jobName)
+	t.Cleanup(func() { renewalRetrySchedule.clear(jobName) })
+
+	if err := cfg.manageOne(ctx, domain, true); err != nil {
+		t.Fatalf("manageOne (async): %v", err)
+	}
+	if !waitUntil(time.Second, func() bool { return issuer.calls.Load() == 1 }) {
+		t.Fatalf("expected one issuance attempt, got %d", issuer.calls.Load())
+	}
+
+	jm.mu.Lock()
+	_, inFlight := jm.names[jobName]
+	jm.mu.Unlock()
+	if inFlight {
+		t.Fatal("renewal job should not remain in flight after a single failed attempt")
+	}
+
+	// A second async management pass must not launch another competing job
+	// while the renewal backoff is active.
+	if err := cfg.manageOne(ctx, domain, true); err != nil {
+		t.Fatalf("manageOne (async, second pass): %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := issuer.calls.Load(); got != 1 {
+		t.Fatalf("expected no additional attempt during backoff, got %d", got)
+	}
+}
+
+// TestRenewCertReleasesLockBetweenRetries verifies that a failing renewal
+// does not hold the storage lock while waiting to retry. Holding it across the
+// whole retry budget would make the certificate permanently occupied by one
+// failing task, preventing other instances (or the maintenance loop) from
+// renewing it even after the original problem is resolved.
+func TestRenewCertReleasesLockBetweenRetries(t *testing.T) {
+	const domain = "lock-between-retries.example.com"
+	issuer := &signalingFailIssuer{
+		attempted: make(chan struct{}),
+		err:       fmt.Errorf("simulated issuance failure"),
+	}
+	storage := &lockTrackingStorage{FileStorage: &FileStorage{Path: t.TempDir()}}
+	cfg := &Config{
+		Issuers:          []Issuer{issuer},
+		Storage:          storage,
+		Logger:           defaultTestLogger,
+		DisableARI:       true,
+		ReusePrivateKeys: true,
+		certCache: &Cache{
+			cache:      make(map[string]Certificate),
+			cacheIndex: make(map[string][]string),
+			logger:     defaultTestLogger,
+		},
+	}
+	cfg.OCSP.DisableStapling = true
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: domain},
+		DNSNames:     []string{domain},
+		NotBefore:    time.Now().Add(-60 * 24 * time.Hour),
+		NotAfter:     time.Now().Add(-time.Hour),
+	}
+	_, priv, certPEM := mustIssueTestCertificate(t, tmpl, nil, nil)
+	privPEM, err := PEMEncodePrivateKey(priv)
+	if err != nil {
+		t.Fatalf("encoding private key: %v", err)
+	}
+	certRes := CertificateResource{
+		SANs:           []string{domain},
+		CertificatePEM: certPEM,
+		PrivateKeyPEM:  privPEM,
+		issuerKey:      issuer.IssuerKey(),
+	}
+	ctx := context.Background()
+	if err := cfg.saveCertResource(ctx, issuer, certRes); err != nil {
+		t.Fatalf("seeding cert resource in storage: %v", err)
+	}
+
+	// Give the first attempt ample time, but cancel before the retry fires.
+	originalIntervals := retryIntervals
+	retryIntervals = []time.Duration{time.Hour}
+	t.Cleanup(func() { retryIntervals = originalIntervals })
+
+	renewCtx, cancelRenew := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		_ = cfg.RenewCertAsync(renewCtx, domain, false)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancelRenew()
+		<-done
+	})
+
+	select {
+	case <-issuer.attempted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renewal never made its first attempt")
+	}
+	if !waitUntil(time.Second, func() bool { return !storage.isLocked() }) {
+		t.Fatal("renewal lock was not released after the failed attempt")
+	}
+
+	// Prove the lock is actually available while the renewal is backing off.
+	lockKey := cfg.lockKey(certIssueLockOp, domain)
+	lockCtx, cancelLock := context.WithTimeout(ctx, 500*time.Millisecond)
+	if err := acquireLock(lockCtx, storage, lockKey); err != nil {
+		cancelLock()
+		t.Fatalf("could not acquire renewal lock during backoff: %v", err)
+	}
+	cancelLock()
+	if err := releaseLock(ctx, storage, lockKey); err != nil {
+		t.Fatalf("releasing test lock: %v", err)
+	}
+
+	cancelRenew()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renewal did not stop after context cancellation")
 	}
 }

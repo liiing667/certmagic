@@ -536,7 +536,7 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 
 	// for an existing certificate, make sure it is renewed; or if it is revoked,
 	// force a renewal even if it's not expiring
-	renew := func() error {
+	renew := func(singleAttempt bool) error {
 		// first, ensure status is not revoked (it was just refreshed in CacheManagedCertificate above)
 		if !cert.Expired() && cert.ocsp != nil && cert.ocsp.Status == ocsp.Revoked {
 			_, err = cfg.forceRenew(ctx, cfg.Logger, cert)
@@ -554,6 +554,17 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 
 		// otherwise, simply renew the certificate if needed
 		if cert.NeedsRenewal(cfg) {
+			// Background management must not submit a job that internally
+			// retries for up to maxRetryDuration. Such a job would hold the
+			// jobManager's dedup slot (and the storage lock) for the certificate
+			// for the whole retry budget, so the maintenance loop could not make
+			// any progress even after the underlying problem clears up. Use the
+			// maintenance path's single-attempt task instead; it is paced by
+			// renewalRetrySchedule and reloads the certificate on success.
+			if singleAttempt {
+				return cfg.certCache.queueRenewalTask(ctx, cert, cfg)
+			}
+
 			var err error
 			if async {
 				err = cfg.RenewCertAsync(ctx, domainName, false)
@@ -574,10 +585,13 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 	}
 
 	if async {
-		jm.Submit(cfg.Logger, "renew_"+domainName, renew)
-		return nil
+		// manageOne runs in its own goroutine for async management (see
+		// manageAll); the actual attempt is submitted to jm by
+		// queueRenewalTask, so do not wrap the whole renewal in another
+		// dedup-protected jm job here.
+		return renew(true)
 	}
-	return renew()
+	return renew(false)
 }
 
 // renewLockLease extends the lease duration on an existing lock if the storage
@@ -945,33 +959,38 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, retry, int
 		return fmt.Errorf("failed storage check: %v - storage is probably misconfigured", err)
 	}
 
-	log.Info("acquiring lock", zap.String("identifier", name))
-
 	// ensure idempotency of the renew operation for this name
 	lockKey := cfg.lockKey(certIssueLockOp, name)
-	err = acquireLock(ctx, cfg.Storage, lockKey)
-	if err != nil {
-		return fmt.Errorf("unable to acquire lock '%s': %v", lockKey, err)
-	}
-	defer func() {
-		log.Info("releasing lock", zap.String("identifier", name))
-
-		if err := releaseLock(ctx, cfg.Storage, lockKey); err != nil {
-			log.Error("unable to unlock",
-				zap.String("identifier", name),
-				zap.String("lock_key", lockKey),
-				zap.Error(err))
-		}
-	}()
-	log.Info("lock acquired", zap.String("identifier", name))
 
 	f := func(ctx context.Context) error {
+		// Acquire the lock for each attempt, not around the whole retry loop.
+		// Otherwise a failing renewal would keep the distributed lock for the
+		// entire retry budget (up to maxRetryDuration), preventing other
+		// instances -- and the periodic maintenance loop -- from attempting to
+		// renew the certificate between attempts. The check below re-reads
+		// storage after locking, so another instance may safely complete the
+		// renewal while we are backing off.
+		log.Info("acquiring lock", zap.String("identifier", name))
+		if err := acquireLock(ctx, cfg.Storage, lockKey); err != nil {
+			return fmt.Errorf("unable to acquire lock '%s': %v", lockKey, err)
+		}
+		defer func() {
+			log.Info("releasing lock", zap.String("identifier", name))
+
+			if err := releaseLock(ctx, cfg.Storage, lockKey); err != nil {
+				log.Error("unable to unlock",
+					zap.String("identifier", name),
+					zap.String("lock_key", lockKey),
+					zap.Error(err))
+			}
+		}()
+		log.Info("lock acquired", zap.String("identifier", name))
+
 		// renew lease on the certificate store lock if the store implementation supports it;
 		// prevents the lock from being acquired by another process/instance while we're renewing
 		attempt, ok := ctx.Value(AttemptsCtxKey).(*int)
 		if ok {
-			err = cfg.renewLockLease(ctx, cfg.Storage, lockKey, *attempt)
-			if err != nil {
+			if err := cfg.renewLockLease(ctx, cfg.Storage, lockKey, *attempt); err != nil {
 				return fmt.Errorf("unable to renew lock lease '%s': %v", lockKey, err)
 			}
 		}

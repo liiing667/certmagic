@@ -490,12 +490,14 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 
 	// do this in a loop because there's an error case that may necessitate a retry, but not more than once
 	var certChains []acme.Certificate
+	var lastErr error
 	for range 2 {
 		am.Logger.Info("using ACME account",
 			zap.String("account_id", params.Account.Location),
 			zap.Strings("account_contact", params.Account.Contact))
 
 		certChains, err = client.acmeClient.ObtainCertificate(ctx, params)
+		lastErr = err
 		if err != nil {
 			var prob acme.Problem
 			if errors.As(err, &prob) && prob.Type == acme.ProblemTypeAccountDoesNotExist {
@@ -526,6 +528,13 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 		break
 	}
 	if len(certChains) == 0 {
+		// If the account-recreation retry also failed, return that actual
+		// failure instead of masking it with a generic "no certificate
+		// chains" error. Callers (and the retry scheduler above us) need the
+		// most recent error to decide whether and when to retry.
+		if lastErr != nil {
+			return nil, usingTestCA, fmt.Errorf("%v %w (ca=%s)", nameSet, lastErr, client.acmeClient.Directory)
+		}
 		return nil, usingTestCA, fmt.Errorf("no certificate chains")
 	}
 
