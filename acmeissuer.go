@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/mholt/acmez/v3"
 	"github.com/mholt/acmez/v3/acme"
@@ -162,6 +163,12 @@ type ACMEIssuer struct {
 
 	config     *Config
 	httpClient *http.Client
+
+	// acmeAccounts points to an *acmeAccountStore. It is accessed atomically
+	// and initialized lazily so ACMEIssuer values created as literals (mostly
+	// in tests) remain valid. A plain unsafe.Pointer keeps ACMEIssuer copyable
+	// (NewACMEIssuer takes its template by value) without embedding locks.
+	acmeAccounts unsafe.Pointer
 
 	// Some fields are changed on-the-fly during
 	// certificate management. For example, the

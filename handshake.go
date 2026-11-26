@@ -493,10 +493,14 @@ func (cfg *Config) checkIfCertShouldBeObtained(ctx context.Context, name string,
 			}
 			return nil
 		}
+		cfg.OnDemand.hostAllowlistMu.RLock()
+		allowed := true
 		if len(cfg.OnDemand.hostAllowlist) > 0 {
-			if _, ok := cfg.OnDemand.hostAllowlist[name]; !ok {
-				return fmt.Errorf("certificate for '%s' is not managed", name)
-			}
+			_, allowed = cfg.OnDemand.hostAllowlist[name]
+		}
+		cfg.OnDemand.hostAllowlistMu.RUnlock()
+		if !allowed {
+			return fmt.Errorf("certificate for '%s' is not managed", name)
 		}
 	}
 	return nil
@@ -516,23 +520,18 @@ func (cfg *Config) obtainOnDemandCertificate(ctx context.Context, hello *tls.Cli
 	}
 
 	// We must protect this process from happening concurrently, so synchronize.
-	obtainCertWaitChansMu.Lock()
-	wait, ok := obtainCertWaitChans[name]
-	if ok {
+	wait, leader := beginCertOperation(name)
+	if !leader {
 		// lucky us -- another goroutine is already obtaining the certificate.
 		// wait for it to finish obtaining the cert and then we'll use it.
-		obtainCertWaitChansMu.Unlock()
-
 		log.Debug("new certificate is needed, but is already being obtained; waiting for that issuance to complete",
 			zap.String("subject", name))
 
-		// TODO: see if we can get a proper context in here, for true cancellation
-		timeout := time.NewTimer(2 * time.Minute)
-		select {
-		case <-timeout.C:
-			return Certificate{}, fmt.Errorf("timed out waiting to obtain certificate for %s", name)
-		case <-wait:
-			timeout.Stop()
+		if err := waitForCertOperation(ctx, wait, 2*time.Minute); err != nil {
+			if errors.Is(err, errCertOperationTimeout) || errors.Is(err, context.DeadlineExceeded) {
+				return Certificate{}, fmt.Errorf("timed out waiting to obtain certificate for %s", name)
+			}
+			return Certificate{}, err
 		}
 
 		// it should now be loaded in the cache, ready to go; if not,
@@ -542,16 +541,14 @@ func (cfg *Config) obtainOnDemandCertificate(ctx context.Context, hello *tls.Cli
 
 	// looks like it's up to us to do all the work and obtain the cert.
 	// make a chan others can wait on if needed
-	wait = make(chan struct{})
-	obtainCertWaitChans[name] = wait
-	obtainCertWaitChansMu.Unlock()
-
+	var finishOnce sync.Once
 	unblockWaiters := func() {
-		obtainCertWaitChansMu.Lock()
-		close(wait)
-		delete(obtainCertWaitChans, name)
-		obtainCertWaitChansMu.Unlock()
+		finishOnce.Do(func() {
+			finishCertOperation(name, wait)
+		})
 	}
+	// Always release waiters, including on a panic or an early return.
+	defer unblockWaiters()
 
 	log.Info("obtaining new certificate", zap.String("server_name", name))
 
@@ -614,55 +611,80 @@ func (cfg *Config) handshakeMaintenance(ctx context.Context, hello *tls.ClientHe
 			zap.Time("this_update", cert.ocsp.ThisUpdate),
 			zap.Time("next_update", cert.ocsp.NextUpdate))
 
-		err := stapleOCSP(ctx, cfg.OCSP, cfg.cachedStorage(), &cert, nil)
-		if err != nil {
-			// An error with OCSP stapling is not the end of the world, and in fact, is
-			// quite common considering not all certs have issuer URLs that support it.
-			if errors.Is(err, ErrNoOCSPServerSpecified) {
-				logger.Debug("stapling OCSP", zap.Error(err))
-			} else {
-				logger.Warn("stapling OCSP", zap.Error(err))
-			}
-		} else {
-			logger.Debug("successfully stapled new OCSP response",
-				zap.Int("ocsp_status", cert.ocsp.Status),
-				zap.Time("this_update", cert.ocsp.ThisUpdate),
-				zap.Time("next_update", cert.ocsp.NextUpdate))
+		// Only one OCSP refresh per certificate at a time. Under a burst of
+		// handshakes, all of them would otherwise contact the responder and
+		// race to write the same staple and cache entry.
+		ocspKey := cert.hash
+		if ocspKey == "" && len(cert.Names) > 0 {
+			ocspKey = cert.Names[0]
 		}
+		if beginOCSPRefresh(ocspKey) {
+			defer endOCSPRefresh(ocspKey)
 
-		// our copy of cert has the new OCSP staple, so replace it in the cache
-		cfg.certCache.mu.Lock()
-		cfg.certCache.cache[cert.hash] = cert
-		cfg.certCache.mu.Unlock()
+			err := stapleOCSP(ctx, cfg.OCSP, cfg.cachedStorage(), &cert, nil)
+			if err != nil {
+				// An error with OCSP stapling is not the end of the world, and in fact, is
+				// quite common considering not all certs have issuer URLs that support it.
+				if errors.Is(err, ErrNoOCSPServerSpecified) {
+					logger.Debug("stapling OCSP", zap.Error(err))
+				} else {
+					logger.Warn("stapling OCSP", zap.Error(err))
+				}
+			} else {
+				logger.Debug("successfully stapled new OCSP response",
+					zap.Int("ocsp_status", cert.ocsp.Status),
+					zap.Time("this_update", cert.ocsp.ThisUpdate),
+					zap.Time("next_update", cert.ocsp.NextUpdate))
+			}
+
+			// our copy of cert has the new OCSP staple, so replace it in the cache
+			cfg.certCache.mu.Lock()
+			cfg.certCache.cache[cert.hash] = cert
+			cfg.certCache.mu.Unlock()
+		} else {
+			logger.Debug("OCSP response is already being refreshed by another handshake")
+		}
 	}
 
 	// Check ARI status, but it's only relevant if the certificate is not expired (otherwise, we already know it needs renewal!)
 	if !cfg.DisableARI && cert.ari.NeedsRefresh() && time.Now().Before(cert.Leaf.NotAfter) {
-		// update ARI in a goroutine to avoid blocking an active handshake, since the results of
-		// this do not strictly affect the handshake; even though the cert may be updated with
-		// the new ARI, it is also updated in the cache and in storage, so future handshakes
-		// will utilize it
-		go func(hello *tls.ClientHelloInfo, cert Certificate, logger *zap.Logger) {
-			// TODO: a different context that isn't tied to the handshake is probably better
-			// than a generic background context; maybe a longer-lived server config context,
-			// or something that the importing package sets on the Config struct; for example,
-			// a Caddy config context could be good, so that ARI updates will continue after
-			// the handshake goes away, but will be stopped if the underlying server is stopped
-			// (for now, use an unusual timeout to help recognize it in log patterns, if needed)
-			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
-			defer cancel()
+		// A swarm of handshakes often arrives right after a certificate is
+		// loaded. Only one ARI refresh per certificate should be in flight;
+		// otherwise each handshake starts another network goroutine and they
+		// all race to write the same cache entry.
+		ariKey := cert.hash
+		if ariKey == "" && len(cert.Names) > 0 {
+			ariKey = cert.Names[0]
+		}
+		if beginARIUpdate(ariKey) {
+			// update ARI in a goroutine to avoid blocking an active handshake, since the results of
+			// this do not strictly affect the handshake; even though the cert may be updated with
+			// the new ARI, it is also updated in the cache and in storage, so future handshakes
+			// will utilize it
+			go func(hello *tls.ClientHelloInfo, cert Certificate, logger *zap.Logger) {
+				defer endARIUpdate(ariKey)
 
-			var err error
-			// we ignore the second return value here because we check renewal status below regardless
-			cert, _, err = cfg.updateARI(ctx, cert, logger)
-			if err != nil {
-				logger.Error("updating ARI", zap.Error(err))
-			}
-			_, err = renewIfNecessary(ctx, hello, cert)
-			if err != nil {
-				logger.Error("renewing certificate based on updated ARI", zap.Error(err))
-			}
-		}(hello, cert, logger)
+				// TODO: a different context that isn't tied to the handshake is probably better
+				// than a generic background context; maybe a longer-lived server config context,
+				// or something that the importing package sets on the Config struct; for example,
+				// a Caddy config context could be good, so that ARI updates will continue after
+				// the handshake goes away, but will be stopped if the underlying server is stopped
+				// (for now, use an unusual timeout to help recognize it in log patterns, if needed)
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+				defer cancel()
+
+				var err error
+				// we ignore the second return value here because we check renewal status below regardless
+				cert, _, err = cfg.updateARI(ctx, cert, logger)
+				if err != nil {
+					logger.Error("updating ARI", zap.Error(err))
+				}
+				_, err = renewIfNecessary(ctx, hello, cert)
+				if err != nil {
+					logger.Error("renewing certificate based on updated ARI", zap.Error(err))
+				}
+			}(hello, cert, logger)
+		}
 	}
 
 	// We attempt to replace any certificates that were revoked.
@@ -702,12 +724,9 @@ func (cfg *Config) renewDynamicCertificate(ctx context.Context, hello *tls.Clien
 	revoked := currentCert.ocsp != nil && currentCert.ocsp.Status == ocsp.Revoked
 
 	// see if another goroutine is already working on this certificate
-	obtainCertWaitChansMu.Lock()
-	wait, ok := obtainCertWaitChans[name]
-	if ok {
+	wait, leader := beginCertOperation(name)
+	if !leader {
 		// lucky us -- another goroutine is already renewing the certificate
-		obtainCertWaitChansMu.Unlock()
-
 		// the current certificate hasn't expired, and another goroutine is already
 		// renewing it, so we might as well serve what we have without blocking, UNLESS
 		// we're forcing renewal, in which case the current certificate is not usable
@@ -726,13 +745,11 @@ func (cfg *Config) renewDynamicCertificate(ctx context.Context, hello *tls.Clien
 			zap.Time("expired", expiresAt(currentCert.Leaf)),
 			zap.Bool("revoked", revoked))
 
-		// TODO: see if we can get a proper context in here, for true cancellation
-		timeout := time.NewTimer(2 * time.Minute)
-		select {
-		case <-timeout.C:
-			return Certificate{}, fmt.Errorf("timed out waiting for certificate renewal of %s", name)
-		case <-wait:
-			timeout.Stop()
+		if err := waitForCertOperation(ctx, wait, 2*time.Minute); err != nil {
+			if errors.Is(err, errCertOperationTimeout) || errors.Is(err, context.DeadlineExceeded) {
+				return Certificate{}, fmt.Errorf("timed out waiting for certificate renewal of %s", name)
+			}
+			return Certificate{}, err
 		}
 
 		// it should now be loaded in the cache, ready to go; if not,
@@ -741,15 +758,11 @@ func (cfg *Config) renewDynamicCertificate(ctx context.Context, hello *tls.Clien
 	}
 
 	// looks like it's up to us to do all the work and renew the cert
-	wait = make(chan struct{})
-	obtainCertWaitChans[name] = wait
-	obtainCertWaitChansMu.Unlock()
-
+	var finishOnce sync.Once
 	unblockWaiters := func() {
-		obtainCertWaitChansMu.Lock()
-		close(wait)
-		delete(obtainCertWaitChans, name)
-		obtainCertWaitChansMu.Unlock()
+		finishOnce.Do(func() {
+			finishCertOperation(name, wait)
+		})
 	}
 
 	logger = logger.With(
@@ -763,6 +776,11 @@ func (cfg *Config) renewDynamicCertificate(ctx context.Context, hello *tls.Clien
 	// Renew and reload the certificate
 	renewAndReload := func(ctx context.Context, cancel context.CancelFunc) (Certificate, error) {
 		defer cancel()
+		// Release waiters on every exit path, including a panic. For the
+		// background-renewal case below, this runs in the renewal goroutine,
+		// not when the handshake itself returns, so other handshakes keep
+		// coalescing onto the same in-flight renewal.
+		defer unblockWaiters()
 
 		// Make sure a certificate for this name should be renewed on-demand
 		err := cfg.checkIfCertShouldBeObtained(ctx, name, true)
@@ -899,16 +917,12 @@ func (cfg *Config) getTLSALPNChallengeCert(clientHello *tls.ClientHelloInfo) (*t
 // If hello.ServerName is empty (i.e. client did not use SNI), then the
 // associated connection's local address is used to extract an IP address.
 func (cfg *Config) getNameFromClientHello(hello *tls.ClientHelloInfo) (string, error) {
-	// IDNs must be converted to punycode for use in TLS certificates (and SNI), but not
-	// all clients do that, so convert IDNs to ASCII according to RFC 5280 section 7
-	// using profile recommended by RFC 5891 section 5; this solves the "σςΣ" problem
-	// (see https://unicode.org/faq/idn.html#22) where not all normalizations are 1:1.
-	// The Lookup profile, for instance, rejects wildcard characters (*), but they
-	// should never be used in the ClientHello SNI anyway.
-	name, err := idna.Lookup.ToASCII(strings.TrimSpace(hello.ServerName))
-	if err != nil {
-		return "", err
-	}
+	// Use the same canonical identity as cache lookups, storage keys, and the
+	// issued certificate's SANs. Previously this path applied IDNA directly
+	// while lookups only lowercased, so the same host could be requested
+	// under one spelling and looked up under another (and IPv6 literals made
+	// IDNA fail outright because of their colons).
+	name := normalizedName(hello.ServerName)
 	if name != "" {
 		return name, nil
 	}
@@ -953,10 +967,36 @@ func localIPFromConn(c net.Conn) string {
 	return ip
 }
 
-// normalizedName returns a cleaned form of serverName that is
-// used for consistency when referring to a SNI value.
+// normalizedName returns the canonical host identity for serverName so that
+// every code path that refers to a host - certificate cache lookups,
+// on-demand issuance, storage keys, ACME challenges, and certificate SANs -
+// uses the same string.
+//
+// DNS names (including IDNs) are lowercased and converted to punycode. IP
+// literals are canonicalized with net.ParseIP instead, because IDNA rejects
+// the colons in IPv6 addresses.
 func normalizedName(serverName string) string {
-	return strings.ToLower(strings.TrimSpace(serverName))
+	serverName = strings.TrimSpace(serverName)
+
+	if host := hostOnly(serverName); host != "" {
+		if zone := strings.IndexByte(host, '%'); zone >= 0 {
+			host = host[:zone]
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			return ip.String()
+		}
+	}
+
+	// The Lookup profile rejects wildcard labels, which are valid managed
+	// identifiers even though they never appear in a real ClientHello SNI.
+	if name, err := idna.Lookup.ToASCII(serverName); err == nil {
+		return name
+	}
+	if name, err := idna.ToASCII(serverName); err == nil {
+		return strings.ToLower(name)
+	}
+
+	return strings.ToLower(serverName)
 }
 
 // obtainCertWaitChans is used to coordinate obtaining certs for each hostname.
@@ -964,6 +1004,99 @@ var (
 	obtainCertWaitChans   = make(map[string]chan struct{})
 	obtainCertWaitChansMu sync.Mutex
 )
+
+// beginCertOperation registers that an obtain/renew operation for name is in
+// progress. It returns the channel waiters should wait on and whether the
+// caller is the leader. All certificate acquisition paths (on-demand
+// handshakes, forced renewals, and background maintenance) use this same
+// registry so they cannot issue the same certificate independently.
+func beginCertOperation(name string) (chan struct{}, bool) {
+	obtainCertWaitChansMu.Lock()
+	defer obtainCertWaitChansMu.Unlock()
+
+	if wait, ok := obtainCertWaitChans[name]; ok {
+		return wait, false
+	}
+	wait := make(chan struct{})
+	obtainCertWaitChans[name] = wait
+	return wait, true
+}
+
+// finishCertOperation releases a name registered by beginCertOperation. It
+// is idempotent at the call site via sync.Once in the callers, but is also
+// defensive about a missing entry so cleanup after an early return or a
+// panic cannot close an unrelated operation's channel.
+func finishCertOperation(name string, wait chan struct{}) {
+	obtainCertWaitChansMu.Lock()
+	if current, ok := obtainCertWaitChans[name]; ok && current == wait {
+		close(wait)
+		delete(obtainCertWaitChans, name)
+	}
+	obtainCertWaitChansMu.Unlock()
+}
+
+var errCertOperationTimeout = errors.New("timed out waiting for certificate operation")
+
+// waitForCertOperation waits for an in-progress certificate operation. A
+// caller's context and the supplied timeout both bound the wait, so a stuck
+// or panicking leader can never pin handshake goroutines forever.
+func waitForCertOperation(ctx context.Context, wait chan struct{}, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return errCertOperationTimeout
+	case <-wait:
+		return nil
+	}
+}
+
+// ARI refreshes are background work; without this registry, every handshake
+// that observes a stale ARI window would start its own goroutine.
+var (
+	ariUpdatesMu sync.Mutex
+	ariUpdates   = make(map[string]struct{})
+)
+
+func beginARIUpdate(key string) bool {
+	ariUpdatesMu.Lock()
+	defer ariUpdatesMu.Unlock()
+	if _, ok := ariUpdates[key]; ok {
+		return false
+	}
+	ariUpdates[key] = struct{}{}
+	return true
+}
+
+func endARIUpdate(key string) {
+	ariUpdatesMu.Lock()
+	delete(ariUpdates, key)
+	ariUpdatesMu.Unlock()
+}
+
+var (
+	ocspRefreshesMu sync.Mutex
+	ocspRefreshes   = make(map[string]struct{})
+)
+
+func beginOCSPRefresh(key string) bool {
+	ocspRefreshesMu.Lock()
+	defer ocspRefreshesMu.Unlock()
+	if _, ok := ocspRefreshes[key]; ok {
+		return false
+	}
+	ocspRefreshes[key] = struct{}{}
+	return true
+}
+
+func endOCSPRefresh(key string) {
+	ocspRefreshesMu.Lock()
+	delete(ocspRefreshes, key)
+	ocspRefreshesMu.Unlock()
+}
 
 // certLoadWaiter coordinates concurrent certificate loading for the same name.
 // The leader populates the result and closes the channel; waiters read the result

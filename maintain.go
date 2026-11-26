@@ -25,6 +25,7 @@ import (
 	"path"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mholt/acmez/v3/acme"
@@ -136,7 +137,16 @@ func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 		}
 
 		// if time is up or expires soon, we need to try to renew it
-		if cert.NeedsRenewal(cfg) {
+		needsRenewal := cert.NeedsRenewal(cfg)
+		if !needsRenewal {
+			// Forget any failure/backoff state left over from an earlier
+			// renewal cycle. Otherwise names that were renewed elsewhere (or
+			// that no longer need renewal) accumulate entries forever in the
+			// shared schedule, which is a slow memory leak in long-running
+			// processes.
+			renewalRetrySchedule.clear("renew_" + cert.Names[0])
+		}
+		if needsRenewal {
 			configs[cert.hash] = cfg
 
 			// see if the certificate in storage has already been renewed, possibly by another
@@ -262,6 +272,26 @@ func (certCache *Cache) queueRenewalTask(ctx context.Context, oldCert Certificat
 	// looping internally for up to maxRetryDuration, it will not block
 	// future maintenance ticks from making progress once it returns.
 	jm.Submit(cfg.Logger, jobName, func() error {
+		// Serialize this renewal with on-demand handshake work, forced
+		// renewals, and other acquisition paths for the same name. The
+		// jobManager deduplicates maintenance jobs, but handshake work does
+		// not go through jm, so without this shared registry a cert could be
+		// renewed twice at once (and the two results could race into the
+		// cache).
+		wait, leader := beginCertOperation(renewName)
+		if !leader {
+			log.Debug("certificate is already being obtained or renewed elsewhere; skipping this maintenance attempt",
+				zap.Strings("identifiers", oldCert.Names))
+			return nil
+		}
+		var finishOnce sync.Once
+		finish := func() {
+			finishOnce.Do(func() {
+				finishCertOperation(renewName, wait)
+			})
+		}
+		defer finish()
+
 		timeLeft := expiresAt(oldCert.Leaf).Sub(time.Now().UTC())
 		log.Info("attempting certificate renewal",
 			zap.Strings("identifiers", oldCert.Names),

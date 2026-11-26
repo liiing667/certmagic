@@ -31,6 +31,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"unsafe"
 
 	"github.com/mholt/acmez/v3/acme"
 	"go.uber.org/zap"
@@ -40,24 +42,98 @@ import (
 // It will try to get one from storage if one exists, and if not, it will create one, all the while
 // honoring the configured account key PEM (if any) to restrict which account is used.
 func (iss *ACMEIssuer) getAccountToUse(ctx context.Context, directory string) (acme.Account, error) {
-	var account acme.Account
-	var err error
-	if iss.AccountKeyPEM != "" {
+	email := iss.getEmail()
+	keyPEM := []byte(iss.AccountKeyPEM)
+	cacheKey := iss.accountCacheKey(directory, email, keyPEM)
+
+	// Account lookups happen for every issuance and renewal. A cheap,
+	// read-mostly cache avoids stampeding storage (and, worse, the ACME
+	// server) when many certificates are managed at once. Only accounts
+	// known to be durable (registered, or loaded from storage) are cached;
+	// a freshly generated unregistered key must not be mistaken for the
+	// durable account identity.
+	if account, ok := iss.cachedAccount(cacheKey); ok {
+		return account, nil
+	}
+
+	return iss.loadAccountShared(ctx, cacheKey, directory, email, keyPEM)
+}
+
+// loadAccountShared loads (or creates) one account per cache key at a time.
+// Concurrent callers for the same CA/account identity wait for the first
+// caller and share its outcome, so they cannot each create a different
+// account key or overwrite each other's account registration.
+func (iss *ACMEIssuer) loadAccountShared(ctx context.Context, cacheKey acmeAccountCacheKey, directory, email string, keyPEM []byte) (account acme.Account, err error) {
+	store := iss.accountStore()
+
+	store.loadsMu.Lock()
+	if load, ok := store.loads[cacheKey]; ok {
+		store.loadsMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return acme.Account{}, ctx.Err()
+		case <-load.done:
+			return load.account, load.err
+		}
+	}
+	load := &acmeAccountLoad{done: make(chan struct{})}
+	store.loads[cacheKey] = load
+	store.loadsMu.Unlock()
+
+	finished := false
+	defer func() {
+		// Always release waiters, even if loading panics. A waiter must never
+		// be stranded on a channel that nobody will close.
+		if !finished {
+			if err == nil {
+				err = fmt.Errorf("loading ACME account was aborted")
+			}
+			account = acme.Account{}
+		}
+
+		store.loadsMu.Lock()
+		load.account, load.err = account, err
+		close(load.done)
+		delete(store.loads, cacheKey)
+		store.loadsMu.Unlock()
+	}()
+
+	if len(keyPEM) > 0 {
 		iss.Logger.Info("using configured ACME account")
-		account, err = iss.GetAccount(ctx, []byte(iss.AccountKeyPEM))
+		account, err = iss.GetAccount(ctx, keyPEM)
 	} else {
-		account, err = iss.loadOrCreateAccount(ctx, directory, iss.getEmail())
+		account, err = iss.loadOrCreateAccount(ctx, directory, email)
 	}
 	if err != nil {
-		return acme.Account{}, fmt.Errorf("getting ACME account: %v", err)
+		err = fmt.Errorf("getting ACME account: %v", err)
+	} else {
+		// Prefer an account that a concurrent registration/save already
+		// published; otherwise cache a registered account now.
+		if cached, ok := iss.cachedAccount(cacheKey); ok {
+			account = cached
+		} else if account.Status != "" {
+			iss.cacheLoadedAccount(cacheKey, account)
+			if cached, ok := iss.cachedAccount(cacheKey); ok {
+				account = cached
+			}
+		}
 	}
-	return account, nil
+
+	finished = true
+	return account, err
 }
 
 // loadOrCreateAccount either loads or creates a new account, depending on if
 // an account can be found in storage for the given CA + email combo.
 func (am *ACMEIssuer) loadOrCreateAccount(ctx context.Context, ca, email string) (acme.Account, error) {
 	acct, err := am.loadAccount(ctx, ca, email)
+	if err == nil {
+		// An account read from storage is durable even if its status field is
+		// empty (for example, an older registration file). Cache it so
+		// concurrent callers do not each reload it and create a different
+		// pending account key.
+		am.cachePersistedAccount(am.accountCacheKey(ca, email, nil), acct)
+	}
 	if errors.Is(err, fs.ErrNotExist) {
 		am.Logger.Info("creating new account because no account for configured email is known to us",
 			zap.String("email", email),
@@ -73,11 +149,23 @@ func (am *ACMEIssuer) loadOrCreateAccount(ctx context.Context, ca, email string)
 
 // loadAccount loads an account from storage, but does not create a new one.
 func (am *ACMEIssuer) loadAccount(ctx context.Context, ca, email string) (acme.Account, error) {
-	regBytes, err := am.config.Storage.Load(ctx, am.storageKeyUserReg(ca, email))
-	if err != nil {
-		return acme.Account{}, err
-	}
-	keyBytes, err := am.config.Storage.Load(ctx, am.storageKeyUserPrivateKey(ca, email))
+	var regBytes, keyBytes []byte
+	err := func() error {
+		// account registration writes the registration and private key as a
+		// pair; use the same read/write lock as saveAccount so a reader cannot
+		// observe a registration from one account with the private key from
+		// another during a concurrent update.
+		acmeAccountStoreMu.RLock()
+		defer acmeAccountStoreMu.RUnlock()
+
+		var err error
+		regBytes, err = am.config.Storage.Load(ctx, am.storageKeyUserReg(ca, email))
+		if err != nil {
+			return err
+		}
+		keyBytes, err = am.config.Storage.Load(ctx, am.storageKeyUserPrivateKey(ca, email))
+		return err
+	}()
 	if err != nil {
 		return acme.Account{}, err
 	}
@@ -206,13 +294,39 @@ func (am *ACMEIssuer) saveAccount(ctx context.Context, ca string, account acme.A
 			value: keyBytes,
 		},
 	}
-	return storeTx(ctx, am.config.Storage, all)
+
+	// Serialize the two-file account update. Without this, concurrent
+	// registrations for the same account identity can interleave their
+	// writes, leaving the registration from one account paired with the
+	// private key from another. Renewal then signs with a different
+	// principal than the account it thinks it is using.
+	acmeAccountStoreMu.Lock()
+	defer acmeAccountStoreMu.Unlock()
+
+	if err := storeTx(ctx, am.config.Storage, all); err != nil {
+		return err
+	}
+
+	// Keep the in-memory cache coherent with storage while still holding
+	// the update lock, so another goroutine cannot reload a stale account
+	// between the write and the cache update.
+	am.cacheAccount(am.accountCacheKey(ca, primaryContact, nil), account)
+	return nil
 }
 
 // deleteAccountLocally deletes the registration info and private key of the account
 // for the given CA from storage.
 func (am *ACMEIssuer) deleteAccountLocally(ctx context.Context, ca string, account acme.Account) error {
 	primaryContact := getPrimaryContact(account)
+
+	acmeAccountStoreMu.Lock()
+	defer acmeAccountStoreMu.Unlock()
+
+	// Invalidate cached account state even if a delete fails partway
+	// through; otherwise a later attempt could keep reusing an account that
+	// no longer exists remotely.
+	am.invalidateAccountCache(ca)
+
 	if err := am.config.Storage.Delete(ctx, am.storageKeyUserReg(ca, primaryContact)); err != nil {
 		return err
 	}
@@ -454,6 +568,146 @@ func getPrimaryContact(account acme.Account) string {
 		}
 	}
 	return primaryContact
+}
+
+// acmeAccountCacheKey identifies a single durable ACME account. The storage
+// identity is part of the key so that two independent Configs using different
+// storage backends never share an account by accident. The configured account
+// key (when present) is part of the key as well, because it pins the identity
+// even if an email is configured or discovered later.
+type acmeAccountCacheKey struct {
+	storage    string
+	directory  string
+	email      string
+	accountKey string
+}
+
+type acmeAccountLoad struct {
+	done    chan struct{}
+	account acme.Account
+	err     error
+}
+
+// acmeAccountStore holds this issuer's cached accounts and coalesces
+// concurrent misses. Keeping it per-issuer avoids sharing account state
+// between unrelated Configs (and between short-lived issuers in tests) while
+// still allowing the account to be reused for every renewal.
+type acmeAccountStore struct {
+	mu       sync.RWMutex
+	accounts map[acmeAccountCacheKey]acme.Account
+
+	loadsMu sync.Mutex
+	loads   map[acmeAccountCacheKey]*acmeAccountLoad
+}
+
+var (
+	// acmeAccountRegLocks serializes account registration in this process,
+	// independently of the storage backend's Lock implementation. Storage
+	// locks remain the cross-process coordination mechanism; this one makes
+	// the single-account guarantee hold even for storages whose Lock is a
+	// no-op or has a coarser scope.
+	acmeAccountRegLocks sync.Map // map[string]*sync.Mutex
+
+	// acmeAccountStoreMu keeps the multi-file account registration in
+	// storage consistent with the in-memory cache. Account writes are rare;
+	// reads of an already-cached account never take this lock.
+	acmeAccountStoreMu sync.RWMutex
+)
+
+func lockAccountRegistration(key string) func() {
+	mu, _ := acmeAccountRegLocks.LoadOrStore(key, new(sync.Mutex))
+	mutex := mu.(*sync.Mutex)
+	mutex.Lock()
+	return mutex.Unlock
+}
+
+func (iss *ACMEIssuer) accountStore() *acmeAccountStore {
+	if store := atomic.LoadPointer(&iss.acmeAccounts); store != nil {
+		return (*acmeAccountStore)(store)
+	}
+
+	store := &acmeAccountStore{
+		accounts: make(map[acmeAccountCacheKey]acme.Account),
+		loads:    make(map[acmeAccountCacheKey]*acmeAccountLoad),
+	}
+	if atomic.CompareAndSwapPointer(&iss.acmeAccounts, nil, unsafe.Pointer(store)) {
+		return store
+	}
+	return (*acmeAccountStore)(atomic.LoadPointer(&iss.acmeAccounts))
+}
+
+func (iss *ACMEIssuer) accountCacheKey(directory, email string, keyPEM []byte) acmeAccountCacheKey {
+	storageID := ""
+	if iss.config != nil && iss.config.Storage != nil {
+		storageID = fmt.Sprintf("%T:%p", iss.config.Storage, iss.config.Storage)
+	}
+	keyID := ""
+	if len(keyPEM) > 0 {
+		keyID = string(keyPEM)
+	}
+	return acmeAccountCacheKey{
+		storage:    storageID,
+		directory:  directory,
+		email:      strings.ToLower(strings.TrimSpace(email)),
+		accountKey: keyID,
+	}
+}
+
+func (iss *ACMEIssuer) cachedAccount(key acmeAccountCacheKey) (acme.Account, bool) {
+	store := iss.accountStore()
+	store.mu.RLock()
+	account, ok := store.accounts[key]
+	store.mu.RUnlock()
+	return account, ok
+}
+
+func (iss *ACMEIssuer) cacheAccount(key acmeAccountCacheKey, account acme.Account) {
+	// Never publish an unregistered account: its private key is not a
+	// durable identity and sharing it would make concurrent requests race
+	// to register different keys under the same account.
+	if account.Status == "" {
+		return
+	}
+	store := iss.accountStore()
+	store.mu.Lock()
+	store.accounts[key] = account
+	store.mu.Unlock()
+}
+
+// cacheLoadedAccount publishes an account read from storage only if a newer
+// value (for example, one just registered and saved by another goroutine) is
+// not already cached. This prevents a slow reader that started before a
+// registration from restoring the superseded account afterwards.
+func (iss *ACMEIssuer) cacheLoadedAccount(key acmeAccountCacheKey, account acme.Account) {
+	if account.Status == "" {
+		return
+	}
+	iss.cachePersistedAccount(key, account)
+}
+
+// cachePersistedAccount publishes an account that came from durable storage.
+// Unlike cacheAccount, it does not require a non-empty status, because the
+// presence of the account files is itself sufficient evidence that the key
+// belongs to a durable account.
+func (iss *ACMEIssuer) cachePersistedAccount(key acmeAccountCacheKey, account acme.Account) {
+	store := iss.accountStore()
+	store.mu.Lock()
+	if _, ok := store.accounts[key]; !ok {
+		store.accounts[key] = account
+	}
+	store.mu.Unlock()
+}
+
+func (iss *ACMEIssuer) invalidateAccountCache(string) {
+	store := iss.accountStore()
+	store.mu.Lock()
+	for key := range store.accounts {
+		// Invalidate every account in this issuer's store. Account
+		// recreation is rare, and being conservative here avoids retaining
+		// an account that no longer exists after recreation or a CA change.
+		delete(store.accounts, key)
+	}
+	store.mu.Unlock()
 }
 
 // When an email address is not explicitly specified, we can remember

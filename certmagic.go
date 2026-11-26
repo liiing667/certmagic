@@ -301,7 +301,8 @@ type OnDemandConfig struct {
 	// we saw a 30s CPU profile for a config managing
 	// 110K names where 29s was spent checking for
 	// duplicates. Order is not important here.)
-	hostAllowlist map[string]struct{}
+	hostAllowlist   map[string]struct{}
+	hostAllowlistMu sync.RWMutex
 }
 
 // PreChecker is an interface that can be optionally implemented by

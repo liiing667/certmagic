@@ -68,6 +68,13 @@ func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, 
 
 		// synchronize this so the account is only created once
 		acctLockKey := accountRegLockKey(account)
+
+		// The storage lock coordinates across processes; this process-local
+		// lock also covers storages whose Lock is a no-op and ensures we
+		// re-check the cache/storage before registering.
+		unlockRegistration := lockAccountRegistration(iss.storageKeyCAPrefix(client.Directory) + "|" + acctLockKey)
+		defer unlockRegistration()
+
 		err = acquireLock(ctx, iss.config.Storage, acctLockKey)
 		if err != nil {
 			return nil, fmt.Errorf("locking account registration: %v", err)
@@ -155,6 +162,16 @@ func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, 
 				zap.String("location", account.Location))
 		}
 	}
+
+	// Publish the registered account under the exact key this client used.
+	// saveAccount already updates the email-based key, but when an account
+	// key PEM is configured the lookup key also contains that PEM; caching it
+	// here makes subsequent issuance/renewal use the same account without
+	// going back to storage or the ACME server.
+	iss.cacheAccount(
+		iss.accountCacheKey(client.Directory, iss.getEmail(), []byte(iss.AccountKeyPEM)),
+		account,
+	)
 
 	c := &acmeClient{
 		iss:        iss,

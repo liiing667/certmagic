@@ -447,8 +447,12 @@ func (cfg *Config) manageAll(ctx context.Context, domainNames []string, async bo
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if cfg.OnDemand != nil && cfg.OnDemand.hostAllowlist == nil {
-		cfg.OnDemand.hostAllowlist = make(map[string]struct{})
+	if cfg.OnDemand != nil {
+		cfg.OnDemand.hostAllowlistMu.Lock()
+		if cfg.OnDemand.hostAllowlist == nil {
+			cfg.OnDemand.hostAllowlist = make(map[string]struct{})
+		}
+		cfg.OnDemand.hostAllowlistMu.Unlock()
 	}
 
 	for _, domainName := range domainNames {
@@ -456,7 +460,9 @@ func (cfg *Config) manageAll(ctx context.Context, domainNames []string, async bo
 
 		// if on-demand is configured, defer obtain and renew operations
 		if cfg.OnDemand != nil {
+			cfg.OnDemand.hostAllowlistMu.Lock()
 			cfg.OnDemand.hostAllowlist[domainName] = struct{}{}
+			cfg.OnDemand.hostAllowlistMu.Unlock()
 			continue
 		}
 
@@ -500,6 +506,31 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 		}
 		// if we don't have one in storage, obtain one
 		obtain := func() error {
+			// Participate in the same per-name operation registry as
+			// handshake-driven issuance. Without this, several Manage*
+			// calls (or a Manage* racing a handshake) can each start an
+			// obtain for the same name and pile up workers waiting on the
+			// storage lock.
+			wait, leader := beginCertOperation(domainName)
+			if !leader {
+				if async {
+					// Another goroutine is already obtaining this
+					// certificate. Returning here keeps background
+					// management from piling up goroutines that just wait
+					// on the same operation.
+					return nil
+				}
+				if err := waitForCertOperation(ctx, wait, 2*time.Minute); err != nil {
+					return fmt.Errorf("%s: waiting for certificate operation: %w", domainName, err)
+				}
+				cert, err = cfg.CacheManagedCertificate(ctx, domainName)
+				if err != nil {
+					return fmt.Errorf("%s: caching certificate: %v", domainName, err)
+				}
+				return nil
+			}
+			defer finishCertOperation(domainName, wait)
+
 			var err error
 			if async {
 				err = cfg.ObtainCertAsync(ctx, domainName)
@@ -554,9 +585,22 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 
 		// otherwise, simply renew the certificate if needed
 		if cert.NeedsRenewal(cfg) {
+			// Join the same operation registry used by handshake renewals so
+			// that background management and an on-demand handshake cannot
+			// renew the same certificate concurrently.
+			wait, leader := beginCertOperation(domainName)
+			if !leader {
+				return nil
+			}
+			defer finishCertOperation(domainName, wait)
+
 			var err error
 			if async {
-				err = cfg.RenewCertAsync(ctx, domainName, false)
+				// Background management must not keep a jobManager worker
+				// (and this certificate's dedup slot) occupied for the whole
+				// retry budget. Make one attempt here; the maintenance loop
+				// owns pacing subsequent attempts.
+				err = cfg.renewCertOnce(ctx, domainName, false)
 			} else {
 				err = cfg.RenewCertSync(ctx, domainName, false)
 			}

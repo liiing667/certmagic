@@ -34,6 +34,9 @@ type namedJob struct {
 func (jm *jobManager) Submit(logger *zap.Logger, name string, job func() error) {
 	jm.mu.Lock()
 	defer jm.mu.Unlock()
+	if jm.maxConcurrentJobs <= 0 {
+		jm.maxConcurrentJobs = 1
+	}
 	if jm.names == nil {
 		jm.names = make(map[string]struct{})
 	}
@@ -64,16 +67,34 @@ func (jm *jobManager) worker() {
 		// counter drifts upward and eventually no new workers ever spawn.
 		jm.mu.Lock()
 		jm.activeWorkers--
+		// A job may have been enqueued after our last empty-queue check but
+		// before this worker released its slot. If that was the last worker,
+		// nobody would pick the job up (Submit may have seen activeWorkers
+		// still at its old value and declined to start another worker). Keep
+		// one worker alive to drain the queue in that case.
+		if jm.activeWorkers == 0 && len(jm.queue) > 0 {
+			jm.activeWorkers++
+			go jm.worker()
+		}
 		jm.mu.Unlock()
 	}()
 
 	for {
 		jm.mu.Lock()
 		if len(jm.queue) == 0 {
+			// Drop the queue's backing array once it is drained. Otherwise
+			// a worker that emptied a large burst (for example, thousands of
+			// renewals submitted at once) keeps that array, and every job
+			// closure it references, alive for the lifetime of the process.
+			jm.queue = nil
 			jm.mu.Unlock()
 			return
 		}
 		next := jm.queue[0]
+		// Clear the slot before reslicing so the completed job (and the
+		// certificate/config it closes over) can be collected even while the
+		// worker is still draining the rest of a large queue.
+		jm.queue[0] = namedJob{}
 		jm.queue = jm.queue[1:]
 		jm.mu.Unlock()
 		// Run the job inside a closure so that the name is always removed

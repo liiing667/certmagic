@@ -285,6 +285,14 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 // This function is NOT safe for concurrent use; callers
 // MUST first acquire a write lock on certCache.mu.
 func (certCache *Cache) removeCertificate(cert Certificate) {
+	// The certificate no longer exists, so any renewal backoff state for it
+	// is no longer useful. Clearing it here (in addition to the check in the
+	// maintenance loop) prevents unbounded growth of that map as certificates
+	// are evicted, removed, or replaced.
+	if len(cert.Names) > 0 {
+		renewalRetrySchedule.clear("renew_" + cert.Names[0])
+	}
+
 	// delete all mentions of this cert from the name index
 	for _, name := range cert.Names {
 		keyList := certCache.cacheIndex[name]
