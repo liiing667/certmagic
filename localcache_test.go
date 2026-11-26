@@ -416,3 +416,59 @@ func TestWarmLocalCache(t *testing.T) {
 		t.Error("Expected an error warming an unknown domain, got none")
 	}
 }
+
+// TestLocalCacheRenewalWindowCertReloadedFromStorage reproduces the
+// "renewal window certificate is not reloaded" failure: a node holds a
+// certificate that has entered its renewal window in its local cache while
+// another instance renews it in shared Storage. A serving-path load (which
+// goes through cachedStorage) must transparently read Storage instead of
+// handing back the expiring local copy.
+func TestLocalCacheRenewalWindowCertReloadedFromStorage(t *testing.T) {
+	ctx := context.Background()
+	const domain = "example.com"
+	now := time.Now()
+
+	cfg, issuer, storage, localCache := testLocalCacheConfig(t)
+	cfg.LocalCache = localCache
+	cfg.OCSP = OCSPConfig{DisableStapling: true}
+
+	// the cert this node has been serving: deep inside its renewal window
+	stale := testIssuedCertResource(t, issuer, domain, now.Add(-100*24*time.Hour))
+	if err := cfg.saveCertResource(ctx, issuer, stale); err != nil {
+		t.Fatalf("serving stale cert: %v", err)
+	}
+	// populate only the local cache with the stale cert
+	staleRes, err := cfg.loadCertResource(ctx, issuer, domain, cfg.cachedStorage())
+	if err != nil {
+		t.Fatalf("warming local cache: %v", err)
+	}
+
+	// another instance renews the cert directly in shared Storage, bypassing
+	// this node's local cache
+	renewed := testIssuedCertResource(t, issuer, domain, now)
+	if err := storage.Store(ctx, StorageKeys.SiteCert(issuer.IssuerKey(), domain), renewed.CertificatePEM); err != nil {
+		t.Fatalf("storing renewed cert: %v", err)
+	}
+
+	// a serving-path load must not return the stale renewal-window cert
+	got, err := cfg.loadCertResource(ctx, issuer, domain, cfg.cachedStorage())
+	if err != nil {
+		t.Fatalf("loading cert through cached storage: %v", err)
+	}
+	if bytes.Equal(got.CertificatePEM, staleRes.CertificatePEM) {
+		t.Fatal("served the stale local-cache cert although it is in its renewal window and Storage holds a renewal")
+	}
+	if !bytes.Equal(got.CertificatePEM, renewed.CertificatePEM) {
+		t.Fatal("expected the renewed certificate from Storage to be loaded")
+	}
+
+	// the storage read must also refresh the local copy so the next
+	// serving-path load is local again and returns the renewed cert
+	cached, err := localCache.Load(ctx, StorageKeys.SiteCert(issuer.IssuerKey(), domain))
+	if err != nil {
+		t.Fatalf("loading refreshed cert from local cache: %v", err)
+	}
+	if !bytes.Equal(cached, renewed.CertificatePEM) {
+		t.Fatal("expected the local cache to be refreshed with the renewed certificate")
+	}
+}

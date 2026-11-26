@@ -50,7 +50,6 @@ import (
 // can access the keyAuth material is by loading it
 // from storage, which is done by distributedSolver.
 type httpSolver struct {
-	closed  int32 // accessed atomically
 	handler http.Handler
 	address string
 }
@@ -71,6 +70,12 @@ func (s *httpSolver) Present(ctx context.Context, _ acme.Challenge) error {
 	// we got a listener; in all other cases return
 	ln, err := robustTryListen(s.address)
 	if ln == nil {
+		// we never started the server, so this challenge never
+		// actually became a user of the shared listener; undo the
+		// count increment, otherwise a later CleanUp would either
+		// underflow the counter or tear the server down while other
+		// challenges are still using it
+		si.count--
 		return err
 	}
 
@@ -97,7 +102,7 @@ func (s *httpSolver) serve(ctx context.Context, si *solverInfo) {
 	}
 	httpServer.SetKeepAlivesEnabled(false)
 	err := httpServer.Serve(si.listener)
-	if err != nil && atomic.LoadInt32(&s.closed) != 1 {
+	if err != nil && atomic.LoadInt32(&si.closed) != 1 {
 		log.Printf("[ERROR] key auth HTTP server: %v", err)
 	}
 }
@@ -107,10 +112,16 @@ func (s *httpSolver) CleanUp(_ context.Context, _ acme.Challenge) error {
 	solversMu.Lock()
 	defer solversMu.Unlock()
 	si := getSolverInfo(s.address)
+	// nothing to clean up if no Present() ever registered a user of
+	// the shared listener; decrementing anyway would underflow the
+	// counter and could stop the server while later challenges wait on it
+	if si.count == 0 {
+		return nil
+	}
 	si.count--
 	if si.count == 0 {
 		// last one out turns off the lights
-		atomic.StoreInt32(&s.closed, 1)
+		atomic.StoreInt32(&si.closed, 1)
 		if si.listener != nil {
 			si.listener.Close()
 			<-si.done
@@ -166,6 +177,12 @@ func (s *tlsALPNSolver) Present(ctx context.Context, chal acme.Challenge) error 
 	// we got a listener; in all other cases return
 	ln, err := robustTryListen(s.address)
 	if ln == nil {
+		// we never started the server, so this challenge never
+		// actually became a user of the shared listener; undo the
+		// count increment, otherwise a later CleanUp would either
+		// underflow the counter or tear the server down while other
+		// challenges are still using it
+		si.count--
 		return err
 	}
 
@@ -228,6 +245,12 @@ func (s *tlsALPNSolver) CleanUp(_ context.Context, chal acme.Challenge) error {
 	solversMu.Lock()
 	defer solversMu.Unlock()
 	si := getSolverInfo(s.address)
+	// nothing to clean up if no Present() ever registered a user of
+	// the shared listener; decrementing anyway would underflow the
+	// counter and could stop the server while later challenges wait on it
+	if si.count == 0 {
+		return nil
+	}
 	si.count--
 	if si.count == 0 {
 		// last one out turns off the lights

@@ -17,6 +17,7 @@ package certmagic
 import (
 	"context"
 	"net"
+	"net/http"
 	"strconv"
 	"testing"
 	"time"
@@ -324,5 +325,128 @@ func TestTryListen(t *testing.T) {
 	_, err = robustTryListen(fakeName)
 	if err == nil {
 		t.Fatalf("robustTryListen(%q) should have failed", fakeName)
+	}
+}
+
+// freeSolverAddr returns a loopback address the challenge servers can bind.
+func freeSolverAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocating free port: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	return addr
+}
+
+// TestHTTPSolverKeepsServerWhileChallengesStillActive verifies that cleaning
+// up one challenge does not tear the shared HTTP challenge server down while
+// another challenge is still using it. Each Present() pairs with a CleanUp(),
+// so after two Present calls and one CleanUp call the server and its
+// solverInfo entry must remain registered for the second challenge.
+func TestHTTPSolverKeepsServerWhileChallengesStillActive(t *testing.T) {
+	addr := freeSolverAddr(t)
+	solver := &httpSolver{
+		handler: http.NewServeMux(),
+		address: addr,
+	}
+	ctx := context.Background()
+
+	if err := solver.Present(ctx, acme.Challenge{}); err != nil {
+		t.Fatalf("first Present: %v", err)
+	}
+	if err := solver.Present(ctx, acme.Challenge{}); err != nil {
+		t.Fatalf("second Present: %v", err)
+	}
+
+	si := getSolverInfo(addr)
+	if si.count != 2 {
+		t.Fatalf("expected shared solver count 2, got %d", si.count)
+	}
+	if si.listener == nil {
+		t.Fatal("expected the shared listener to be running")
+	}
+
+	if err := solver.CleanUp(ctx, acme.Challenge{}); err != nil {
+		t.Fatalf("first CleanUp: %v", err)
+	}
+
+	si = getSolverInfo(addr)
+	if si.count != 1 {
+		t.Fatalf("expected shared solver count 1 after first CleanUp, got %d", si.count)
+	}
+	if si.listener == nil {
+		t.Fatal("CleanUp of one challenge stopped the server while another challenge was still waiting on it")
+	}
+
+	// full cleanup still has to stop the server once the last challenge goes
+	if err := solver.CleanUp(ctx, acme.Challenge{}); err != nil {
+		t.Fatalf("final CleanUp: %v", err)
+	}
+	if _, ok := solvers[addr]; ok {
+		t.Fatal("expected full cleanup to remove the shared solver entry")
+	}
+
+	// an extra CleanUp (e.g. a canceled challenge whose Present never
+	// registered) must not underflow the counter or panic
+	if err := solver.CleanUp(ctx, acme.Challenge{}); err != nil {
+		t.Fatalf("extra CleanUp: %v", err)
+	}
+}
+
+// TestTLSALPNSolverCleanUpDoesNotUnderflow mirrors the HTTP solver check for
+// the TLS-ALPN challenge server's shared listener lifecycle.
+func TestTLSALPNSolverCleanUpDoesNotUnderflow(t *testing.T) {
+	addr := freeSolverAddr(t)
+	solver := &tlsALPNSolver{address: addr}
+	ctx := context.Background()
+
+	// simulate the state Present() leaves behind once the listener is up
+	si := getSolverInfo(addr)
+	si.count = 2
+
+	// the first cleanup must leave the server in place for the other challenge
+	if err := solver.CleanUp(ctx, acme.Challenge{}); err != nil {
+		t.Fatalf("first CleanUp: %v", err)
+	}
+	if getSolverInfo(addr).count != 1 {
+		t.Fatalf("expected solver count 1 after first CleanUp")
+	}
+
+	// the last cleanup removes the entry; the listener is nil here so it does
+	// not block on a server goroutine
+	if err := solver.CleanUp(ctx, acme.Challenge{}); err != nil {
+		t.Fatalf("final CleanUp: %v", err)
+	}
+	if _, ok := solvers[addr]; ok {
+		t.Fatal("expected full cleanup to remove the shared solver entry")
+	}
+
+	// a canceled challenge whose Present never registered must not underflow
+	if err := solver.CleanUp(ctx, acme.Challenge{}); err != nil {
+		t.Fatalf("extra CleanUp: %v", err)
+	}
+}
+
+// TestSolverPresentWithoutListenerBalancesCount verifies that a Present()
+// which cannot start the shared listener (robustTryListen returns no
+// listener) does not leave an inflated challenge count behind; otherwise the
+// matching CleanUp() would underflow the counter or tear the server down
+// while later challenges are still waiting on it.
+func TestSolverPresentWithoutListenerBalancesCount(t *testing.T) {
+	// nothing can bind on an invalid address, so robustTryListen returns no
+	// listener and Present must balance the count it incremented
+	addr := "127.0.0.1:-1"
+	solver := &httpSolver{handler: http.NewServeMux(), address: addr}
+	if err := solver.Present(context.Background(), acme.Challenge{}); err == nil {
+		t.Fatal("expected Present to fail with an unbindable address")
+	}
+	if si := getSolverInfo(addr); si.count != 0 {
+		t.Fatalf("Present without a listener must balance its count increment, got count=%d", si.count)
+	}
+	// cleanup after the failed Present must be a no-op rather than underflow
+	if err := solver.CleanUp(context.Background(), acme.Challenge{}); err != nil {
+		t.Fatalf("CleanUp after failed Present: %v", err)
 	}
 }

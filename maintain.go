@@ -634,7 +634,10 @@ func (cfg *Config) updateARI(ctx context.Context, cert Certificate, logger *zap.
 				err = fmt.Errorf("got new ARI from %s, but could not re-encode certificate metadata: %v", iss.IssuerKey(), err)
 				return
 			}
-			if err = cfg.Storage.Store(ctx, StorageKeys.SiteMeta(cert.issuerKey, cert.Names[0]), certResBytes); err != nil {
+			// write through the local cache as well, otherwise nodes with a
+			// LocalCache keep serving the previous (expiring) metadata until
+			// the cache entry happens to be replaced
+			if err = cfg.groundTruthStorage().Store(ctx, StorageKeys.SiteMeta(cert.issuerKey, cert.Names[0]), certResBytes); err != nil {
 				err = fmt.Errorf("got new ARI from %s, but could not store it with certificate metadata: %v", iss.IssuerKey(), err)
 				return
 			}
