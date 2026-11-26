@@ -293,9 +293,7 @@ func New(certCache *Cache, cfg Config) *Config {
 	if certCache == nil {
 		panic("a certificate cache is required")
 	}
-	certCache.optionsMu.RLock()
-	getConfigForCert := certCache.options.GetConfigForCert
-	defer certCache.optionsMu.RUnlock()
+	getConfigForCert := certCache.optionsSnapshot().GetConfigForCert
 	if getConfigForCert == nil {
 		panic("cache must have GetConfigForCert set in its options")
 	}

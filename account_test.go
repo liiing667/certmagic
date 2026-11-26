@@ -17,6 +17,7 @@ package certmagic
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -394,6 +395,126 @@ func TestGetAccountWithEmailAlreadyExists(t *testing.T) {
 		if call.name == "List" {
 			t.Error("Unexpected List call")
 		}
+	}
+}
+
+func TestGetAccountWithEmailPinsConfiguredAccountAmongOthers(t *testing.T) {
+	ctx := context.Background()
+
+	storage := &recordingStorage{Storage: &memoryStorage{}}
+	am := &ACMEIssuer{CA: dummyCA, Logger: zap.NewNop(), mu: new(sync.Mutex)}
+	testConfig := &Config{
+		Issuers:   []Issuer{am},
+		Storage:   storage,
+		Logger:    defaultTestLogger,
+		certCache: new(Cache),
+	}
+	am.config = testConfig
+
+	// Save the decoy first so deterministic List ordering presents it before
+	// the account named by the configured email.
+	decoyEmail := "decoy@foobar.com"
+	decoyAccount, err := am.newAccount(decoyEmail)
+	if err != nil {
+		t.Fatalf("Error creating decoy account: %v", err)
+	}
+	if err := am.saveAccount(ctx, am.CA, decoyAccount); err != nil {
+		t.Fatalf("Error saving decoy account: %v", err)
+	}
+
+	email := "pinned@foobar.com"
+	account, err := am.newAccount(email)
+	if err != nil {
+		t.Fatalf("Error creating account: %v", err)
+	}
+	if err := am.saveAccount(ctx, am.CA, account); err != nil {
+		t.Fatalf("Error saving account: %v", err)
+	}
+
+	am.Email = email
+	if err := am.setEmail(ctx, false); err != nil {
+		t.Fatalf("setEmail error: %v", err)
+	}
+
+	keyBytes, err := PEMEncodePrivateKey(account.PrivateKey)
+	if err != nil {
+		t.Fatalf("Error encoding private key: %v", err)
+	}
+
+	loadedAccount, err := am.GetAccount(ctx, keyBytes)
+	if err != nil {
+		t.Fatalf("Error getting pinned account: %v", err)
+	}
+	if !privateKeysSame(account.PrivateKey, loadedAccount.PrivateKey) {
+		t.Error("GetAccount returned a different account key")
+	}
+	if !reflect.DeepEqual(account.Contact, loadedAccount.Contact) {
+		t.Errorf("Expected contacts %v, got %v", account.Contact, loadedAccount.Contact)
+	}
+
+	// The configured email is part of the storage identity; scanning every
+	// account must not be necessary to find the matching key.
+	for _, call := range storage.calls {
+		if call.name == "List" {
+			t.Error("GetAccount listed all accounts even though email pins the storage key")
+		}
+	}
+}
+
+func TestGetAccountWithEmailRecoversUnreadableRegistration(t *testing.T) {
+	ctx := context.Background()
+
+	storage := &memoryStorage{}
+	am := &ACMEIssuer{CA: dummyCA, Logger: zap.NewNop(), mu: new(sync.Mutex)}
+	testConfig := &Config{
+		Issuers:   []Issuer{am},
+		Storage:   storage,
+		Logger:    defaultTestLogger,
+		certCache: new(Cache),
+	}
+	am.config = testConfig
+
+	email := "recover@foobar.com"
+	account, err := am.newAccount(email)
+	if err != nil {
+		t.Fatalf("Error creating account: %v", err)
+	}
+	if err := am.saveAccount(ctx, am.CA, account); err != nil {
+		t.Fatalf("Error saving account: %v", err)
+	}
+
+	// The key is intact and pinned by email, but the registration sidecar is
+	// unreadable. Renewal should be able to recover the same account through
+	// the CA instead of permanently failing on the local decode error.
+	regKey := am.storageKeyUserReg(am.CA, email)
+	if err := storage.Delete(ctx, regKey); err != nil {
+		t.Fatalf("Error deleting registration: %v", err)
+	}
+	if err := storage.Store(ctx, regKey, []byte("{not-valid-json")); err != nil {
+		t.Fatalf("Error storing corrupt registration: %v", err)
+	}
+
+	am.Email = email
+	if err := am.setEmail(ctx, false); err != nil {
+		t.Fatalf("setEmail error: %v", err)
+	}
+
+	keyBytes, err := PEMEncodePrivateKey(account.PrivateKey)
+	if err != nil {
+		t.Fatalf("Error encoding private key: %v", err)
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = am.GetAccount(canceledCtx, keyBytes)
+	if err == nil {
+		t.Fatal("Expected account lookup to fail with canceled context")
+	}
+	// Some ACME client layers format context errors without preserving the
+	// wrapper chain, so also accept the canonical context cancellation text.
+	if !errors.Is(err, context.Canceled) &&
+		!strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("Expected corrupt local registration to trigger CA lookup and observe %v, got: %v", context.Canceled, err)
 	}
 }
 

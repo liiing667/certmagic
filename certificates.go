@@ -95,9 +95,7 @@ func (cfg *Config) certNeedsRenewal(leaf *x509.Certificate, ari acme.RenewalInfo
 		}
 		return false
 	}
-	cfg.certCache.optionsMu.RLock()
-	renewCheckInterval := cfg.certCache.options.RenewCheckInterval
-	cfg.certCache.optionsMu.RUnlock()
+	renewCheckInterval := cfg.certCache.optionsSnapshot().RenewCheckInterval
 
 	expiration := expiresAt(leaf)
 

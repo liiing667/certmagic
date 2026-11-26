@@ -122,7 +122,14 @@ func (am *ACMEIssuer) GetAccount(ctx context.Context, privateKeyPEM []byte) (acm
 	} else {
 		keyBytes, err := am.config.Storage.Load(ctx, am.storageKeyUserPrivateKey(am.CA, email))
 		if err == nil && bytes.Equal(bytes.TrimSpace(keyBytes), bytes.TrimSpace(privateKeyPEM)) {
-			return am.loadAccount(ctx, am.CA, email)
+			// The configured email has pinned us to this account's key. A
+			// corrupt or incomplete registration sidecar must not strand an
+			// otherwise valid, existing account: fall through to looking up
+			// the same key with the CA and re-saving its registration. This
+			// mirrors the empty-email/List path below.
+			if account, loadErr := am.loadAccount(ctx, am.CA, email); loadErr == nil {
+				return account, nil
+			}
 		}
 	}
 	return am.lookUpAccount(ctx, privateKeyPEM)

@@ -14,7 +14,10 @@
 
 package certmagic
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestNewCache(t *testing.T) {
 	noop := func(Certificate) (*Config, error) { return new(Config), nil }
@@ -38,5 +41,38 @@ func TestNewCache(t *testing.T) {
 	}
 	if c.stopChan == nil {
 		t.Error("Expected stopChan to be set, but it was nil")
+	}
+}
+
+func TestCacheOptionsSnapshotTracksSafeReloads(t *testing.T) {
+	noop := func(Certificate) (*Config, error) { return new(Config), nil }
+	original := CacheOptions{
+		GetConfigForCert:   noop,
+		RenewCheckInterval: time.Minute,
+		OCSPCheckInterval:  2 * time.Hour,
+		Capacity:           7,
+	}
+	c := NewCache(original)
+	defer c.Stop()
+
+	snapshot := c.optionsSnapshot()
+	if snapshot.RenewCheckInterval != time.Minute ||
+		snapshot.OCSPCheckInterval != 2*time.Hour ||
+		snapshot.Capacity != 7 ||
+		snapshot.GetConfigForCert == nil {
+		t.Fatalf("unexpected initial options snapshot: %+v", snapshot)
+	}
+
+	reloaded := original
+	reloaded.RenewCheckInterval = 30 * time.Second
+	reloaded.OCSPCheckInterval = 45 * time.Minute
+	reloaded.Capacity = 9
+	c.SetOptions(reloaded)
+
+	snapshot = c.optionsSnapshot()
+	if snapshot.RenewCheckInterval != 30*time.Second ||
+		snapshot.OCSPCheckInterval != 45*time.Minute ||
+		snapshot.Capacity != 9 {
+		t.Fatalf("reload was not visible through locked snapshot: %+v", snapshot)
 	}
 }

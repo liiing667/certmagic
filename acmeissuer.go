@@ -502,7 +502,7 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 				am.Logger.Warn("ACME account does not exist on server; attempting to recreate",
 					zap.String("account_id", client.account.Location),
 					zap.Strings("account_contact", client.account.Contact),
-					zap.String("key_location", am.storageKeyUserPrivateKey(client.acmeClient.Directory, am.getEmail())),
+					zap.String("key_location", am.storageKeyUserPrivateKey(client.acmeClient.Directory, getPrimaryContact(client.account))),
 					zap.Any("problem", prob))
 
 				// the account we have no longer exists on the CA, so we need to create a new one;
@@ -519,6 +519,12 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 				if err != nil {
 					return nil, false, err
 				}
+				// OrderParametersFromCSR captured the previous account. The
+				// retry must sign and log with the recreated account, not the
+				// locally-deleted one, otherwise the same missing-account
+				// failure is repeated and another account may be created on
+				// the next issuance.
+				params.Account = client.account
 				continue
 			}
 			return nil, usingTestCA, fmt.Errorf("%v %w (ca=%s)", nameSet, err, client.acmeClient.Directory)

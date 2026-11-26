@@ -136,6 +136,17 @@ func (certCache *Cache) SetOptions(opts CacheOptions) {
 	certCache.optionsMu.Unlock()
 }
 
+// optionsSnapshot returns a copy of the current options under the options
+// lock. Maintenance and renewal decisions that need more than one option
+// should use one snapshot so a reload cannot leave them comparing values from
+// two different CacheOptions generations.
+func (certCache *Cache) optionsSnapshot() CacheOptions {
+	certCache.optionsMu.RLock()
+	opts := certCache.options
+	certCache.optionsMu.RUnlock()
+	return opts
+}
+
 // Stop stops the maintenance goroutine for
 // certificates in certCache. It blocks until
 // stopping is complete. Once a cache is
@@ -145,9 +156,10 @@ func (certCache *Cache) Stop() {
 	<-certCache.doneChan      // wait for stop to complete
 }
 
-// CacheOptions is used to configure certificate caches.
-// Once a cache has been created with certain options,
-// those settings cannot be changed.
+// CacheOptions is used to configure certificate caches. Values may be
+// replaced at runtime with SetOptions; readers must use optionsSnapshot or
+// otherwise hold optionsMu while reading fields that participate in the same
+// decision.
 type CacheOptions struct {
 	// REQUIRED. A function that returns a configuration
 	// used for managing a certificate, or for accessing
@@ -357,9 +369,7 @@ func (certCache *Cache) getAllCerts() []Certificate {
 }
 
 func (certCache *Cache) getConfig(cert Certificate) (*Config, error) {
-	certCache.optionsMu.RLock()
-	getCert := certCache.options.GetConfigForCert
-	certCache.optionsMu.RUnlock()
+	getCert := certCache.optionsSnapshot().GetConfigForCert
 
 	cfg, err := getCert(cert)
 	if err != nil {
